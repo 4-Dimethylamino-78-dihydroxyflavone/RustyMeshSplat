@@ -1,0 +1,23 @@
+[package]
+name = "msplat-colmap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+which.workspace = true
+dirs.workspace = true
+zip.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+glam.workspace = true
+colmap-reader.workspace = true
+tokio = { workspace = true, features = ["process", "fs", "io-util", "macros", "rt"] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

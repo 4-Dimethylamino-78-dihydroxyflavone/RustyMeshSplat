@@ -1,0 +1,31 @@
+[package]
+name = "meshsplat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "meshsplat"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+indicatif.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+glam.workspace = true
+humantime.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "fs"] }
+tokio-stream.workspace = true
+
+msplat-colmap.workspace = true
+msplat-mesh.workspace = true
+
+brush-process.workspace = true
+brush-vfs.workspace = true
+
+wgpu = { workspace = true, features = ["vulkan", "gles", "dx12", "metal"] }

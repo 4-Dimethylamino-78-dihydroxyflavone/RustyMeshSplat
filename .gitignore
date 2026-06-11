@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.ply
+*.glb
+*.obj
+/out
+/work
+.DS_Store

@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/msplat-colmap",
+    "crates/msplat-mesh",
+    "crates/meshsplat",
+]
+default-members = ["crates/meshsplat"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/4-Dimethylamino-78-dihydroxyflavone/RustyMeshSplat"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4.5", features = ["derive"] }
+indicatif = "0.18"
+log = "0.4"
+env_logger = "0.11"
+tokio = { version = "1.42", default-features = false }
+tokio-stream = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+glam = "0.30"
+rayon = "1.11"
+humantime = "2"
+which = "7"
+dirs = "6"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "webpki-roots",
+    "stream",
+] }
+futures-util = "0.3"
+
+# Brush: universal-GPU (wgpu) gaussian splat training, pinned to a known-good rev.
+brush-process = { git = "https://github.com/ArthurBrussee/brush", rev = "f043db463d7534c0a312f632447d19e0dcbad9d1" }
+brush-vfs = { git = "https://github.com/ArthurBrussee/brush", rev = "f043db463d7534c0a312f632447d19e0dcbad9d1" }
+colmap-reader = { git = "https://github.com/ArthurBrussee/brush", rev = "f043db463d7534c0a312f632447d19e0dcbad9d1" }
+
+wgpu = { version = "29", default-features = false, features = ["naga-ir"] }
+
+msplat-colmap = { path = "crates/msplat-colmap" }
+msplat-mesh = { path = "crates/msplat-mesh" }
+
+# Brush requires a patched wgpu (WebGPU subgroup mapping + cubecl transition_resources)
+# and burn from git main. Patches in brush's own manifest do not propagate to
+# dependents, so they are replicated here, pinned to the revs from brush's Cargo.lock.
+[patch.crates-io]
+wgpu = { git = "https://github.com/ArthurBrussee/wgpu", rev = "49686ba1a731bf7f40c5535db12b6bdd66a19f67" }
+wgpu-core = { git = "https://github.com/ArthurBrussee/wgpu", rev = "49686ba1a731bf7f40c5535db12b6bdd66a19f67" }
+wgpu-hal = { git = "https://github.com/ArthurBrussee/wgpu", rev = "49686ba1a731bf7f40c5535db12b6bdd66a19f67" }
+wgpu-types = { git = "https://github.com/ArthurBrussee/wgpu", rev = "49686ba1a731bf7f40c5535db12b6bdd66a19f67" }
+naga = { git = "https://github.com/ArthurBrussee/wgpu", rev = "49686ba1a731bf7f40c5535db12b6bdd66a19f67" }
+
+# cubecl-wgpu pins wgpu to a git rev of gfx-rs/wgpu (not crates.io), so the
+# patch above doesn't catch it — redirect that source too, otherwise two
+# parallel wgpu trees end up in the graph and brush-process fails to compile.
+[patch."https://github.com/gfx-rs/wgpu.git"]
+wgpu = { git = "https://github.com/ArthurBrussee/wgpu", rev = "49686ba1a731bf7f40c5535db12b6bdd66a19f67" }
+wgpu-core = { git = "https://github.com/ArthurBrussee/wgpu", rev = "49686ba1a731bf7f40c5535db12b6bdd66a19f67" }
+wgpu-hal = { git = "https://github.com/ArthurBrussee/wgpu", rev = "49686ba1a731bf7f40c5535db12b6bdd66a19f67" }
+wgpu-types = { git = "https://github.com/ArthurBrussee/wgpu", rev = "49686ba1a731bf7f40c5535db12b6bdd66a19f67" }
+naga = { git = "https://github.com/ArthurBrussee/wgpu", rev = "49686ba1a731bf7f40c5535db12b6bdd66a19f67" }
+
+# Burn rides brush's `branch = "main"` git dependency; it is pinned to the
+# rev from brush's own Cargo.lock (08a12343) via this workspace's Cargo.lock
+# (`cargo update -p burn --precise <rev>`), which is checked in.
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+
+# Heavy numeric crates stay optimized even in dev builds, like brush does.
+[profile.dev.package."*"]
+opt-level = 2
