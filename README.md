@@ -23,6 +23,7 @@ machine. This project's bedrock is the **universal GPU layer instead**:
 |---|---|---|
 | Training & compute | [Burn](https://burn.dev) + [wgpu](https://wgpu.rs) (via [Brush](https://github.com/ArthurBrussee/brush)) | Vulkan, DirectX 12, Metal, OpenGL — AMD, Intel, NVIDIA, Apple |
 | Camera poses | [COLMAP](https://colmap.github.io) binary (BSD), auto-downloaded on Windows | CPU (GPU optional, never required) |
+| Camera poses, *optional* (`--poses mapanything`) | [MapAnything](https://github.com/facebookresearch/map-anything) in a [uv](https://docs.astral.sh/uv/)-provisioned Python subprocess | CUDA / Apple-silicon GPU (CPU possible, slow) |
 | Mesh extraction | Pure Rust (rayon) TSDF fusion + surface nets | CPU |
 
 No CUDA toolchain, no Python, no ONNX. On Windows it just uses DX12/Vulkan
@@ -76,6 +77,10 @@ meshsplat ./my_photos --quality fast
 # turntable / rotated-specimen captures (ordered frames, one camera)
 meshsplat ./insect_frames --capture sequential --single-camera
 
+# sparse / low-overlap captures where COLMAP fails: feed-forward poses
+# (needs uv + a CUDA/Metal GPU; weights download on first run)
+meshsplat ./sparse_photos --poses mapanything
+
 # only train the splat, skip meshing
 meshsplat ./my_photos --splat-only
 
@@ -88,14 +93,16 @@ meshsplat --doctor
 
 Key flags: `--iters`, `--max-splats`, `--max-resolution` (training);
 `--grid-res`, `--opacity-min`, `--smooth-iters` (meshing); `--cpu-sfm`,
-`--colmap <PATH>` (pose estimation). See `meshsplat --help`.
+`--colmap <PATH>`, `--poses <BACKEND>` (pose estimation). See
+`meshsplat --help`.
 
 ### Inputs
 
 - **Directory of photos** (`.jpg/.png/.tif/...`): full pipeline. EXIF focal
   lengths are used automatically by COLMAP when present.
-- **Posed dataset** (COLMAP `sparse/` or nerfstudio `transforms.json`):
-  pose estimation is skipped.
+- **Posed dataset** (COLMAP `sparse/` or `sparse/0/`, binary or text, or
+  nerfstudio `transforms.json`): pose estimation is skipped. This ingests
+  the raw output of MapAnything's / VGGT's `demo_colmap.py` directly.
 - **Splat `.ply`** with `--mesh-only`: only mesh extraction runs.
 
 ### Difficult scenes (low overlap, turntables, glossy specimens)
@@ -119,11 +126,12 @@ levers for each (informed by the 2025–2026 pose-estimation literature):
 - **Low-overlap / sparse / wide-baseline sets**: COLMAP needs ~60–80% overlap
   to shine. When it registers too few images, feed-forward pose transformers
   (VGGT, π³, MapAnything — CO3Dv2 pose AUC ~88 vs ~25 for classical SfM on
-  object-centric data) are the state of the art. They are Python/PyTorch
-  research code, so meshsplat doesn't bundle them; instead it **accepts their
-  COLMAP-format exports directly**: run e.g. VGGT's `demo_colmap.py` on your
-  photos, then point meshsplat at the resulting dataset directory (it detects
-  `sparse/` — binary or text format — and skips its own SfM).
+  object-centric data) are the state of the art. **`--poses mapanything`
+  runs one for you** (see [Feed-forward pose estimation](#feed-forward-pose-estimation---poses)
+  below). meshsplat also still **accepts COLMAP-format exports directly**:
+  run e.g. VGGT's `demo_colmap.py` yourself, then point meshsplat at the
+  resulting dataset directory (it detects `sparse/` or `sparse/0/` — binary
+  or text — and skips its own SfM).
 - **Hundreds of images**: `--sfm-mapper global` uses the GLOMAP global mapper
   (integrated in COLMAP 4+, 1–2 orders of magnitude faster at comparable
   accuracy); it falls back to incremental automatically on older COLMAP builds.
@@ -139,11 +147,57 @@ On Windows, if none is found it downloads the official prebuilt
 (`colmap-x64-windows-nocuda.zip`) into the user cache automatically.
 On Linux/macOS install it once: `sudo apt install colmap` / `brew install colmap`.
 
+### Feed-forward pose estimation (`--poses`)
+
+`--poses mapanything` replaces COLMAP's Stage 1 with
+[MapAnything](https://github.com/facebookresearch/map-anything), Meta's
+feed-forward metric 3D reconstruction transformer — the right tool when
+COLMAP registers too few images (sparse captures, wide baselines,
+object-centric orbits). The core promise stays intact: the meshsplat binary
+remains pure Rust. The model runs in a subprocess from a bundled,
+version-pinned [PEP 723](https://peps.python.org/pep-0723/) script whose
+Python environment [uv](https://docs.astral.sh/uv/) provisions automatically
+on first use; the script exports a COLMAP-format model that flows into the
+same training/meshing stages.
+
+Requirements and behavior:
+
+- **uv** on `$PATH` (or `--uv <PATH>` / `$MESHSPLAT_UV`). No uv? Point
+  `$MESHSPLAT_FFPOSE_PYTHON` at a Python that already has
+  `mapanything[colmap]` installed.
+- A **CUDA or Apple-silicon GPU** for sensible speed. `--poses-allow-cpu`
+  permits CPU inference (minutes per scene). This GPU requirement applies
+  *only* to this optional backend — the rest of meshsplat still needs no CUDA.
+- **First run** resolves the Python environment and downloads model weights
+  (~2–3 GB) into the Hugging Face / meshsplat caches; later runs start fast.
+- **EXIF focal lengths** are passed to the model as per-view intrinsics
+  (MapAnything's multi-modal inference accepts any subset of calibration
+  inputs and measurably improves with them). `--poses-no-exif` disables this.
+- The exported dataset uses the model-resolution processed images that the
+  predicted intrinsics describe, so the splat trains at the model's working
+  resolution (~0.5 MP). For maximum-fidelity captures with good overlap,
+  classical COLMAP at full resolution may still win — try both.
+
+Weights and licensing — pick deliberately:
+
+| Flag | Model | License |
+|---|---|---|
+| *(default)* `--poses-model apache` | `facebook/map-anything-apache` | Apache-2.0 (commercial OK) |
+| `--poses-model best` | `facebook/map-anything` | CC BY-NC 4.0 (non-commercial) |
+| `--poses mast3r` | [MASt3R](https://github.com/naver/mast3r) + sparse global alignment, via MapAnything's wrapper | CC BY-NC-SA 4.0 (non-commercial) |
+
+meshsplat prints a license notice whenever a non-commercial option is used.
+`--poses-model` also accepts any Hugging Face model id compatible with
+`MapAnything.from_pretrained`.
+
 ## Pipeline
 
 1. **Camera poses** — COLMAP feature extraction → matching (exhaustive for
    small sets, sequential for ordered/turntable sets) → incremental mapping.
-   GPU SIFT is attempted and falls back to CPU transparently.
+   GPU SIFT is attempted and falls back to CPU transparently. With
+   `--poses mapanything|mast3r`, a feed-forward model produces the poses
+   instead (uv-provisioned Python subprocess emitting the same COLMAP-format
+   model).
 2. **Splat training** — [Brush](https://github.com/ArthurBrussee/brush)'s
    gaussian splat trainer on Burn/wgpu, driven as a library with our progress
    UI. Exports a standard 3DGS `splat.ply`.
@@ -158,8 +212,11 @@ On Linux/macOS install it once: `sudo apt install colmap` / `brew install colmap
 
 - Learned matching front-end (ALIKED + LightGlue via COLMAP 4's ONNX path)
   for low-texture / wide-baseline captures
-- Optional feed-forward pose backend (VGGT/π³-class) once portable
-  (non-PyTorch) inference for those models exists
+- Full-resolution training after feed-forward poses: back-project
+  MapAnything's intrinsics from the processed crops onto the original photos
+- COLMAP-rescue hybrid: feed a partial COLMAP solve (poses + intrinsics for
+  the registered subset) into MapAnything's multi-modal inference to complete
+  the scene
 - GPU depth-map rendering + depth TSDF fusion (RaDe-GS-style) for higher
   mesh fidelity
 - [MILo](https://github.com/Anttwo/MILo) / [MeshSplatting](https://meshsplatting.github.io/)-style
@@ -184,6 +241,7 @@ patched wgpu fork — keep it checked in.
 |---|---|
 | `crates/meshsplat` | CLI binary: stage orchestration, progress UI, GPU probe |
 | `crates/msplat-colmap` | COLMAP locate/auto-download, SfM pipeline runner, sparse-model parsing |
+| `crates/msplat-ffpose` | Feed-forward poses: uv runtime discovery, bundled MapAnything script, subprocess orchestration |
 | `crates/msplat-mesh` | Splat PLY loader, TSDF fusion, surface nets, PLY/OBJ/GLB export |
 
 ## License

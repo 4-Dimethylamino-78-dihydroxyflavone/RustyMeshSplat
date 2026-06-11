@@ -93,7 +93,7 @@ impl Default for SfmOptions {
 /// Progress events from the SfM pipeline.
 pub enum SfmEvent {
     StageStarted {
-        name: &'static str,
+        name: String,
         index: usize,
         total: usize,
     },
@@ -156,7 +156,7 @@ pub async fn run_sfm(
 
     // Stage 1: feature extraction.
     on_event(SfmEvent::StageStarted {
-        name: "Extracting features",
+        name: "Extracting features".to_owned(),
         index: 1,
         total: total_stages,
     });
@@ -199,7 +199,8 @@ pub async fn run_sfm(
             "Matching images (exhaustive)"
         } else {
             "Matching images (sequential)"
-        },
+        }
+        .to_owned(),
         index: 2,
         total: total_stages,
     });
@@ -230,7 +231,7 @@ pub async fn run_sfm(
 
     // Stage 3: mapping (bundle adjustment included).
     on_event(SfmEvent::StageStarted {
-        name: "Reconstructing camera poses",
+        name: "Reconstructing camera poses".to_owned(),
         index: 3,
         total: total_stages,
     });

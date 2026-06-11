@@ -23,6 +23,7 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "fs"]
 tokio-stream.workspace = true
 
 msplat-colmap.workspace = true
+msplat-ffpose.workspace = true
 msplat-mesh.workspace = true
 
 brush-process.workspace = true

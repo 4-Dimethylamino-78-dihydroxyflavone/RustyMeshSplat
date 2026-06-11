@@ -5108,6 +5108,7 @@ dependencies = [
  "indicatif",
  "log",
  "msplat-colmap",
+ "msplat-ffpose",
  "msplat-mesh",
  "serde",
  "serde_json",
@@ -5209,6 +5210,20 @@ dependencies = [
  "tokio",
  "which",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "msplat-ffpose"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "log",
+ "msplat-colmap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "which",
 ]
 
 [[package]]
