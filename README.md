@@ -28,6 +28,42 @@ machine. This project's bedrock is the **universal GPU layer instead**:
 No CUDA toolchain, no Python, no ONNX. On Windows it just uses DX12/Vulkan
 through your normal graphics driver.
 
+## Fail-proof GPU bring-up (Windows first-class)
+
+`meshsplat` treats "the GPU just works" as a hard requirement, not a hope.
+At startup it walks a **selection ladder** instead of trusting one backend:
+
+1. Every backend is probed in reliability order for your OS —
+   Windows: **Vulkan → DirectX 12 → OpenGL**, macOS: Metal,
+   Linux: Vulkan → OpenGL.
+2. Within each backend, real GPUs are ranked discrete → integrated → virtual;
+   software rasterizers (WARP, llvmpipe) are excluded unless you opt in.
+3. Each candidate is actually brought up (device + queue created with the
+   exact feature set the trainer needs). **Any failure falls through to the
+   next candidate** — a broken Vulkan driver never takes the run down when
+   DX12 works, which is the single most common Windows failure mode.
+4. Only if the whole ladder is exhausted do you get one clean, actionable
+   error — and it happens **in milliseconds, before pose estimation runs**,
+   never after twenty minutes of COLMAP.
+
+You stay in control when you want to be:
+
+| Flag | Effect |
+|---|---|
+| `--gpu-backend dx12` | Pin a backend (`vulkan`, `dx12`, `metal`, `gl`) |
+| `--gpu-index N` | Pin a specific adapter from the `--doctor` list |
+| `--allow-software` | Last-resort software rasterizer (WARP/llvmpipe): glacial, but turns "no GPU" into "still got a model" |
+| `--doctor` | Show every adapter on every backend, in selection order |
+
+Works on any Windows 10/11 machine with a working graphics driver — AMD,
+Intel, NVIDIA, laptop iGPUs included. There is nothing to install: no CUDA
+toolkit, no cuDNN, no ONNX runtime, no Python environment. If a game can
+render on the machine, meshsplat can train on it. (Mesh extraction,
+`--mesh-only`, is pure CPU and needs no GPU at all.)
+
+Prebuilt binaries (`meshsplat-windows-x64.zip` and friends) are produced by
+CI for every tagged release.
+
 ## Usage
 
 ```text

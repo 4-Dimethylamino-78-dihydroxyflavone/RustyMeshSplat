@@ -1,0 +1,73 @@
+name: Release binaries
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The flagship artifact: a single Windows .exe that runs on any
+          # Windows 10/11 machine with a DX12/Vulkan/GL-capable driver.
+          # No CUDA, no Python, no installer.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: meshsplat-windows-x64
+            binary: meshsplat.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: meshsplat-linux-x64
+            binary: meshsplat
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: meshsplat-macos-arm64
+            binary: meshsplat
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p meshsplat --target ${{ matrix.target }}
+
+      - name: Smoke-test the binary
+        run: ./target/${{ matrix.target }}/release/${{ matrix.binary }} --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+
+  release:
+    name: attach to GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Package
+        run: |
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            (cd "$name" && zip -r "../$name.zip" .)
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true

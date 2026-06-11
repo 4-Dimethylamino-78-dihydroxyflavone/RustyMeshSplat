@@ -25,6 +25,22 @@ pub struct TrainOutcome {
 
 const SPLAT_FILE: &str = "splat.ply";
 
+/// `element vertex N` from a PLY header.
+fn ply_vertex_count(path: &Path) -> Option<u32> {
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    for line in reader.lines().take(64) {
+        let line = line.ok()?;
+        if line.trim() == "end_header" {
+            break;
+        }
+        if let Some(rest) = line.trim().strip_prefix("element vertex ") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
 /// Train a gaussian splat on a Brush-compatible dataset directory
 /// (COLMAP `images/` + `sparse/0/`, or nerfstudio `transforms.json`).
 pub async fn train_splat(
@@ -54,9 +70,8 @@ pub async fn train_splat(
         },
     );
 
-    // Bring up the universal GPU backend (wgpu: Vulkan / DX12 / Metal / GL).
-    brush_process::burn_init_setup().await;
-
+    // The GPU was already brought up (and registered with Brush) by
+    // gpu::init_for_training before any pipeline stage ran.
     let bar = multi.add(
         ProgressBar::new(iters as u64).with_style(
             ProgressStyle::with_template(
@@ -121,6 +136,11 @@ pub async fn train_splat(
             "Training finished but no splat was exported to {}",
             splat_path.display()
         );
+    }
+    // Refine messages only fire every few hundred iters; for short runs read
+    // the authoritative count from the exported PLY header.
+    if final_splats == 0 {
+        final_splats = ply_vertex_count(&splat_path).unwrap_or(0);
     }
     Ok(TrainOutcome {
         splat_path,

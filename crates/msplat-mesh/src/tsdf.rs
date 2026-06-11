@@ -294,8 +294,8 @@ fn fuse(
     let num_slabs = nz.div_ceil(SLAB);
     let mut slab_splats: Vec<Vec<u32>> = vec![Vec::new(); num_slabs];
     for (fi, fp) in footprints.iter().enumerate() {
-        for slab in (fp.z_min / SLAB)..=(fp.z_max / SLAB) {
-            slab_splats[slab].push(fi as u32);
+        for bucket in &mut slab_splats[(fp.z_min / SLAB)..=(fp.z_max / SLAB)] {
+            bucket.push(fi as u32);
         }
     }
 

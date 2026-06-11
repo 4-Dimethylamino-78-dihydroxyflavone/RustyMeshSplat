@@ -38,7 +38,7 @@ impl ColmapBinary {
             .map(|o| {
                 String::from_utf8_lossy(&o.stdout)
                     .lines()
-                    .any(|l| l.trim().split_whitespace().next() == Some(command))
+                    .any(|l| l.split_whitespace().next() == Some(command))
             })
             .unwrap_or(false)
     }

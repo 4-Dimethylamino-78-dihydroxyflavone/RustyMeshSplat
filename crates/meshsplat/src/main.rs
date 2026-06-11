@@ -97,6 +97,19 @@ struct Cli {
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
+    /// GPU backend for training: auto (recommended), vulkan, dx12, metal, gl.
+    /// Auto tries every backend in reliability order and falls through on
+    /// failure instead of crashing.
+    #[arg(long, default_value = "auto")]
+    gpu_backend: String,
+    /// Pin a specific adapter by its index in the `--doctor` list.
+    #[arg(long)]
+    gpu_index: Option<usize>,
+    /// Permit software rasterizers (WARP/llvmpipe). Extremely slow, but
+    /// produces a result on machines with no working GPU at all.
+    #[arg(long)]
+    allow_software: bool,
+
     /// Print GPU + COLMAP diagnostics and exit.
     #[arg(long)]
     doctor: bool,
@@ -198,7 +211,15 @@ fn spinner(multi: &MultiProgress, msg: String) -> ProgressBar {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(err) = run().await {
+        // One clean, actionable error — no Rust backtrace wall.
+        eprintln!("\n✘ {err:#}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     // Default to warnings so the progress UI stays readable; RUST_LOG overrides.
     // wgpu_hal spams ERROR logs while probing backends that have no driver
     // (expected on most machines) — keep those out of the default view.
@@ -208,9 +229,16 @@ async fn main() -> Result<()> {
     .init();
     let cli = Cli::parse();
 
-    let gpu_report = gpu::probe().await;
+    let gpu_opts = gpu::GpuOptions {
+        backend: cli
+            .gpu_backend
+            .parse::<gpu::BackendChoice>()
+            .map_err(anyhow::Error::msg)?,
+        index: cli.gpu_index,
+        allow_software: cli.allow_software,
+    };
     if cli.doctor {
-        return doctor(&cli, &gpu_report).await;
+        return doctor(&cli, &gpu_opts).await;
     }
 
     let input = cli
@@ -223,26 +251,23 @@ async fn main() -> Result<()> {
     let out_dir = std::path::absolute(&cli.output)?;
     std::fs::create_dir_all(&out_dir)?;
 
-    let mut run = RunReport {
-        gpu: gpu_report
-            .best()
-            .map(|a| format!("{} ({})", a.name, a.backend)),
-        ..Default::default()
-    };
+    let mut run = RunReport::default();
 
-    match gpu_report.best() {
-        Some(a) => eprintln!("◆ GPU: {} via {} [{}]", a.name, a.backend, a.device_type),
-        None => eprintln!("◆ GPU: none detected"),
-    }
-
+    // Bring the GPU up *first* when training is needed: a machine that can't
+    // train should fail in milliseconds, not after minutes of pose estimation.
     let needs_training = !matches!(kind, InputKind::SplatPly(_));
-    if needs_training && !gpu_report.has_usable_gpu() {
-        bail!(
-            "No usable GPU found. Training needs a Vulkan, DirectX 12, Metal or \
-             OpenGL capable device (any vendor — AMD, Intel, NVIDIA, Apple — no \
-             CUDA required). Update your GPU drivers and retry, or run with \
-             --mesh-only on a splat trained elsewhere."
-        );
+    if needs_training {
+        let active = gpu::init_for_training(&gpu_opts).await?;
+        eprintln!("◆ GPU: {}", active.describe());
+        if active.software {
+            eprintln!(
+                "  ⚠ software rasterizer — expect training to take hours; \
+                 any real GPU will be dramatically faster"
+            );
+        }
+        run.gpu = Some(active.describe());
+    } else {
+        eprintln!("◆ GPU: not needed (--mesh-only runs on CPU)");
     }
 
     let multi = MultiProgress::new();
@@ -483,15 +508,37 @@ async fn run_sfm_stage(
     Ok(output)
 }
 
-/// `--doctor`: report GPU adapters and COLMAP availability.
-async fn doctor(cli: &Cli, gpu_report: &gpu::GpuReport) -> Result<()> {
+/// `--doctor`: report GPU adapters (in selection-ladder order) and COLMAP
+/// availability.
+async fn doctor(cli: &Cli, gpu_opts: &gpu::GpuOptions) -> Result<()> {
     println!("meshsplat doctor\n────────────────");
-    if gpu_report.adapters.is_empty() {
-        println!("GPU: no adapters found — training will not work on this machine.");
+    let candidates = gpu::enumerate(gpu_opts.backend).await;
+    if candidates.is_empty() {
+        println!(
+            "GPU: no adapters found — training will not work on this machine.\n\
+             Training needs Vulkan, DirectX 12, Metal or OpenGL via your normal\n\
+             graphics driver (any vendor, no CUDA). Updating the driver usually\n\
+             fixes this. Mesh extraction (--mesh-only) works without a GPU."
+        );
     } else {
-        println!("GPU adapters (training uses the first usable one):");
-        for a in &gpu_report.adapters {
-            println!("  • {} — {} [{}]", a.name, a.backend, a.device_type);
+        println!("GPU adapters, in selection order (pin one with --gpu-index N):");
+        let mut chosen = false;
+        for (i, c) in candidates.iter().enumerate() {
+            let mark = if !c.software && !chosen {
+                chosen = true;
+                "→ would use"
+            } else if c.software {
+                "(software — needs --allow-software)"
+            } else {
+                ""
+            };
+            println!("  [{i}] {} {mark}", c.describe());
+        }
+        if !chosen {
+            println!(
+                "  Only software rasterizers found; training requires \
+                 --allow-software (very slow)."
+            );
         }
     }
     match msplat_colmap::locate_colmap(cli.colmap.as_deref()) {
