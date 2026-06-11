@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/msplat-colmap",
+    "crates/msplat-ffpose",
     "crates/msplat-mesh",
     "crates/meshsplat",
 ]
@@ -45,6 +46,7 @@ colmap-reader = { git = "https://github.com/ArthurBrussee/brush", rev = "f043db4
 wgpu = { version = "29", default-features = false, features = ["naga-ir"] }
 
 msplat-colmap = { path = "crates/msplat-colmap" }
+msplat-ffpose = { path = "crates/msplat-ffpose" }
 msplat-mesh = { path = "crates/msplat-mesh" }
 
 # Brush requires a patched wgpu (WebGPU subgroup mapping + cubecl transition_resources)

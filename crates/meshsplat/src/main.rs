@@ -73,6 +73,28 @@ struct Cli {
     #[arg(long, default_value = "incremental")]
     sfm_mapper: String,
 
+    /// Pose backend: colmap (default), or a feed-forward model for
+    /// low-overlap / object-centric captures where classical SfM fails —
+    /// mapanything, or mast3r (CC BY-NC-SA, non-commercial only). The
+    /// feed-forward backends run via a uv-provisioned Python subprocess
+    /// and want a CUDA/Metal GPU (see --poses-allow-cpu).
+    #[arg(long, default_value = "colmap")]
+    poses: String,
+    /// MapAnything weights: apache (default, commercially usable), best
+    /// (higher quality, CC BY-NC non-commercial), or a Hugging Face model id.
+    #[arg(long, default_value = "apache")]
+    poses_model: String,
+    /// Let feed-forward pose estimation fall back to CPU when no CUDA/Metal
+    /// GPU is available (minutes per scene instead of seconds).
+    #[arg(long)]
+    poses_allow_cpu: bool,
+    /// Don't pass EXIF focal lengths to the feed-forward model as intrinsics.
+    #[arg(long)]
+    poses_no_exif: bool,
+    /// Path to a uv binary (otherwise $MESHSPLAT_UV, then $PATH).
+    #[arg(long)]
+    uv: Option<PathBuf>,
+
     /// Stop after training: produce only the splat, skip mesh extraction.
     #[arg(long)]
     splat_only: bool,
@@ -276,9 +298,25 @@ async fn run() -> Result<()> {
     // ── Stage 1: camera poses ───────────────────────────────────────────
     let (dataset_dir, sparse_dir): (PathBuf, Option<PathBuf>) = match &kind {
         InputKind::Photos(photos) => {
-            eprintln!("\n■ Stage 1/3 — camera poses (COLMAP)");
-            let work_dir = out_dir.join("work").join("colmap");
-            let sfm = run_sfm_stage(&cli, photos, &work_dir, &multi).await?;
+            let (sfm, backend, model) = if cli.poses.eq_ignore_ascii_case("colmap") {
+                eprintln!("\n■ Stage 1/3 — camera poses (COLMAP)");
+                let work_dir = out_dir.join("work").join("colmap");
+                let sfm = run_sfm_stage(&cli, photos, &work_dir, &multi).await?;
+                (sfm, "colmap".to_owned(), None)
+            } else {
+                let backend = cli
+                    .poses
+                    .parse::<msplat_ffpose::FfBackend>()
+                    .map_err(anyhow::Error::msg)?;
+                eprintln!(
+                    "\n■ Stage 1/3 — camera poses ({}, feed-forward)",
+                    backend.name()
+                );
+                let work_dir = out_dir.join("work").join("ffpose");
+                let (sfm, model) =
+                    run_ffpose_stage(&cli, backend, photos, &work_dir, &multi).await?;
+                (sfm, backend.name().to_owned(), Some(model))
+            };
             eprintln!(
                 "  registered {}/{} photos, {} sparse points in {}",
                 sfm.stats.registered_images,
@@ -287,6 +325,8 @@ async fn run() -> Result<()> {
                 humantime::format_duration(Duration::from_secs(sfm.stats.elapsed.as_secs()))
             );
             run.sfm = Some(SfmReport {
+                backend,
+                model,
                 input_images: sfm.stats.input_images,
                 registered_images: sfm.stats.registered_images,
                 sparse_points: sfm.stats.sparse_points,
@@ -296,7 +336,16 @@ async fn run() -> Result<()> {
         }
         InputKind::Dataset(dir) => {
             eprintln!("\n■ Stage 1/3 — camera poses: dataset already posed, skipping");
-            let sparse = dir.join("sparse").join("0");
+            // COLMAP lays models out as `sparse/0`, but feed-forward
+            // exporters (MapAnything, VGGT, ...) write to bare `sparse/`.
+            // Brush's loader handles both; the mesh stage needs the actual
+            // model dir for camera-aware normals.
+            let sparse0 = dir.join("sparse").join("0");
+            let sparse = if sparse0.is_dir() {
+                sparse0
+            } else {
+                dir.join("sparse")
+            };
             (dir.clone(), sparse.is_dir().then_some(sparse))
         }
         InputKind::SplatPly(_) => (PathBuf::new(), cli.sparse.clone()),
@@ -508,6 +557,93 @@ async fn run_sfm_stage(
     Ok(output)
 }
 
+/// Stage 1 (alternative): feed-forward pose estimation. A uv-provisioned
+/// Python subprocess runs MapAnything (or MASt3R through its wrapper) and
+/// exports a COLMAP-format model; the rest of the pipeline is unchanged.
+async fn run_ffpose_stage(
+    cli: &Cli,
+    backend: msplat_ffpose::FfBackend,
+    photos: &Path,
+    work_dir: &Path,
+    multi: &MultiProgress,
+) -> Result<(msplat_colmap::SfmOutput, String)> {
+    use msplat_ffpose::{FfBackend, FfposeOptions, ModelChoice};
+
+    let find_bar = spinner(multi, "Locating uv...".into());
+    let Some(runtime) = msplat_ffpose::locate(cli.uv.as_deref()) else {
+        bail!(
+            "--poses {} needs `uv` to provision its Python environment, and none \
+             was found.\n  Install uv (one static binary): https://docs.astral.sh/uv/ \
+             — or point MESHSPLAT_FFPOSE_PYTHON at a Python that already has \
+             mapanything installed.",
+            backend.name()
+        );
+    };
+    if !runtime.works() {
+        bail!(
+            "{} does not run (`--version` failed) — reinstall it or pass --uv",
+            runtime.binary().display()
+        );
+    }
+    find_bar.finish_with_message(format!("Runtime: {}", runtime.describe()));
+
+    let model: ModelChoice = cli.poses_model.parse().expect("infallible");
+    // Surface license terms on every run so they land in logs and CI output.
+    let model_label = match backend {
+        FfBackend::Mast3r => {
+            eprintln!(
+                "  ⚠ MASt3R code and weights are CC BY-NC-SA — non-commercial use only"
+            );
+            "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric".to_owned()
+        }
+        FfBackend::MapAnything => {
+            if model.non_commercial() {
+                eprintln!(
+                    "  ⚠ facebook/map-anything weights are CC BY-NC — non-commercial \
+                     use only (the default --poses-model apache is unrestricted)"
+                );
+            }
+            model.hf_id().to_owned()
+        }
+    };
+    eprintln!("  first run sets up a Python env and downloads weights (~2–3 GB)");
+
+    let opts = FfposeOptions {
+        backend,
+        model,
+        device: "auto".to_owned(),
+        allow_cpu: cli.poses_allow_cpu,
+        exif_intrinsics: !cli.poses_no_exif,
+    };
+
+    let stage_bar = multi.add(
+        ProgressBar::new(1).with_style(
+            ProgressStyle::with_template("  {bar:38.cyan/dim} {pos}/{len} {msg}")
+                .expect("static template")
+                .progress_chars("=> "),
+        ),
+    );
+    stage_bar.enable_steady_tick(Duration::from_millis(250));
+
+    let output = msplat_ffpose::run_ffpose(&runtime, photos, work_dir, &opts, |event| {
+        match event {
+            SfmEvent::StageStarted { name, index, total } => {
+                stage_bar.set_position(0);
+                stage_bar.set_length(1);
+                stage_bar.set_message(format!("[{index}/{total}] {name}"));
+            }
+            SfmEvent::Progress { done, total } => {
+                stage_bar.set_length(total);
+                stage_bar.set_position(done);
+            }
+            SfmEvent::Status(status) => stage_bar.set_message(status),
+        }
+    })
+    .await?;
+    stage_bar.finish_with_message("poses ready");
+    Ok((output, model_label))
+}
+
 /// `--doctor`: report GPU adapters (in selection-ladder order) and COLMAP
 /// availability.
 async fn doctor(cli: &Cli, gpu_opts: &gpu::GpuOptions) -> Result<()> {
@@ -550,6 +686,13 @@ async fn doctor(cli: &Cli, gpu_opts: &gpu::GpuOptions) -> Result<()> {
         None => println!(
             "COLMAP: not found — it will be downloaded automatically on Windows, \
              or install it via your package manager (apt/brew install colmap)."
+        ),
+    }
+    match msplat_ffpose::locate(cli.uv.as_deref()) {
+        Some(rt) => println!("uv (feed-forward poses): {}", rt.describe()),
+        None => println!(
+            "uv: not found — only needed for --poses mapanything|mast3r \
+             (install from https://docs.astral.sh/uv/)."
         ),
     }
     Ok(())

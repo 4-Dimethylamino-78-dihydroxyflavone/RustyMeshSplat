@@ -14,6 +14,10 @@ pub struct RunReport {
 
 #[derive(Serialize)]
 pub struct SfmReport {
+    /// "colmap", "mapanything" or "mast3r".
+    pub backend: String,
+    /// Model identifier for feed-forward backends; None for COLMAP.
+    pub model: Option<String>,
     pub input_images: usize,
     pub registered_images: usize,
     pub sparse_points: usize,
