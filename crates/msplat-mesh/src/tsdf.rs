@@ -21,6 +21,13 @@ pub struct MeshParams {
     pub min_weight: f32,
     /// Laplacian smoothing passes on the extracted mesh.
     pub smooth_iters: u32,
+    /// Close the surface into a watertight solid: fill enclosed interior and
+    /// bridge gaps so the mesh wraps around instead of leaving observed-only
+    /// open boundaries.
+    pub watertight: bool,
+    /// When watertight: dilate the solid region by this many voxels to bridge
+    /// holes up to ~2× this wide before sealing. 0 = fill cavities only.
+    pub close_voxels: u32,
 }
 
 impl Default for MeshParams {
@@ -32,6 +39,8 @@ impl Default for MeshParams {
             bbox_percentile: 0.01,
             min_weight: 0.25,
             smooth_iters: 2,
+            watertight: false,
+            close_voxels: 2,
         }
     }
 }
@@ -111,13 +120,20 @@ pub fn extract_mesh(
     on_progress(ExtractProgress::Phase("Fusing TSDF"));
     let voxels = fuse(cloud, &kept, camera_centers, &grid, params, &mut on_progress);
 
-    on_progress(ExtractProgress::Phase("Extracting surface"));
     let trunc = params.trunc_voxels * grid.voxel;
-    let sdf_at = |i: usize| -> Option<f32> {
-        let v = voxels[i];
-        (v.weight >= params.min_weight).then(|| (v.sdf / v.weight).clamp(-trunc, trunc))
+    let (positions, indices) = if params.watertight {
+        on_progress(ExtractProgress::Phase("Closing surface"));
+        let field = close_field(&voxels, &grid, params, trunc);
+        on_progress(ExtractProgress::Phase("Extracting surface"));
+        surface_nets(&grid.dims, |x, y, z| Some(field[grid.index(x, y, z)]))
+    } else {
+        on_progress(ExtractProgress::Phase("Extracting surface"));
+        let sdf_at = |i: usize| -> Option<f32> {
+            let v = voxels[i];
+            (v.weight >= params.min_weight).then(|| (v.sdf / v.weight).clamp(-trunc, trunc))
+        };
+        surface_nets(&grid.dims, |x, y, z| sdf_at(grid.index(x, y, z)))
     };
-    let (positions, indices) = surface_nets(&grid.dims, |x, y, z| sdf_at(grid.index(x, y, z)));
     if positions.is_empty() {
         bail!(
             "No surface found. The splat may be too sparse or the opacity \
@@ -366,4 +382,163 @@ fn nearest_camera_dir(camera_centers: &[Vec3], pos: Vec3, centroid: Vec3) -> Vec
         }
     }
     dir.normalize_or(Vec3::Z)
+}
+
+/// The (up to six) axis-neighbours of a voxel, as linear indices.
+fn neighbors6(
+    x: usize,
+    y: usize,
+    z: usize,
+    [nx, ny, nz]: [usize; 3],
+) -> impl Iterator<Item = usize> {
+    let idx = move |x: usize, y: usize, z: usize| (z * ny + y) * nx + x;
+    [
+        (x > 0).then(|| idx(x - 1, y, z)),
+        (x + 1 < nx).then(|| idx(x + 1, y, z)),
+        (y > 0).then(|| idx(x, y - 1, z)),
+        (y + 1 < ny).then(|| idx(x, y + 1, z)),
+        (z > 0).then(|| idx(x, y, z - 1)),
+        (z + 1 < nz).then(|| idx(x, y, z + 1)),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+/// Complete the truncated SDF into a closed (watertight) field.
+///
+/// Observed voxels keep their fused signed distance (preserving detail).
+/// Unobserved voxels are classified by flood-filling the *exterior* inward
+/// from the grid boundary: voxels the flood can reach are empty (`+trunc`),
+/// the rest are enclosed interior (`-trunc`). The solid region is first
+/// dilated by `close_voxels` so the flood cannot leak through small gaps,
+/// which seals holes and lets partially-observed objects wrap shut.
+fn close_field(voxels: &[Voxel], grid: &Grid, params: &MeshParams, trunc: f32) -> Vec<f32> {
+    let n = grid.num_voxels();
+    let dims = grid.dims;
+    let [nx, ny, _nz] = dims;
+    let coords = |i: usize| (i % nx, (i / nx) % ny, i / (nx * ny));
+
+    let known: Vec<Option<f32>> = voxels
+        .iter()
+        .map(|v| (v.weight >= params.min_weight).then(|| (v.sdf / v.weight).clamp(-trunc, trunc)))
+        .collect();
+    let mut solid: Vec<bool> = known
+        .iter()
+        .map(|s| matches!(s, Some(d) if *d < 0.0))
+        .collect();
+
+    // Dilate the solid region into unobserved voxels to bridge holes.
+    for _ in 0..params.close_voxels {
+        let add: Vec<usize> = (0..n)
+            .into_par_iter()
+            .filter(|&i| {
+                if solid[i] || known[i].is_some() {
+                    return false;
+                }
+                let (x, y, z) = coords(i);
+                neighbors6(x, y, z, dims).any(|j| solid[j])
+            })
+            .collect();
+        for i in add {
+            solid[i] = true;
+        }
+    }
+
+    // Flood the exterior from every boundary voxel that isn't solid.
+    let mut exterior = vec![false; n];
+    let mut stack = Vec::new();
+    for i in 0..n {
+        let (x, y, z) = coords(i);
+        let on_boundary =
+            x == 0 || y == 0 || z == 0 || x == nx - 1 || y == ny - 1 || z == dims[2] - 1;
+        if on_boundary && !solid[i] {
+            exterior[i] = true;
+            stack.push(i);
+        }
+    }
+    while let Some(i) = stack.pop() {
+        let (x, y, z) = coords(i);
+        for j in neighbors6(x, y, z, dims) {
+            if !solid[j] && !exterior[j] {
+                exterior[j] = true;
+                stack.push(j);
+            }
+        }
+    }
+
+    (0..n)
+        .map(|i| match known[i] {
+            Some(d) => d,
+            None if exterior[i] => trunc,
+            None => -trunc,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shell_grid(gap: bool) -> (Grid, Vec<Voxel>) {
+        // 7³ grid; a closed shell on the faces of the inner [1,5]³ cube.
+        let grid = Grid {
+            dims: [7, 7, 7],
+            origin: Vec3::ZERO,
+            voxel: 1.0,
+        };
+        let mut voxels = vec![Voxel::default(); grid.num_voxels()];
+        for z in 1..=5 {
+            for y in 1..=5 {
+                for x in 1..=5 {
+                    let on_face = x == 1 || x == 5 || y == 1 || y == 5 || z == 1 || z == 5;
+                    if on_face {
+                        let v = &mut voxels[grid.index(x, y, z)];
+                        v.sdf = -1.0; // inside
+                        v.weight = 1.0;
+                    }
+                }
+            }
+        }
+        if gap {
+            // Punch a one-voxel hole in the top face.
+            voxels[grid.index(3, 3, 5)] = Voxel::default();
+        }
+        (grid, voxels)
+    }
+
+    #[test]
+    fn watertight_fills_enclosed_interior() {
+        let (grid, voxels) = shell_grid(false);
+        let params = MeshParams {
+            close_voxels: 0,
+            ..MeshParams::default()
+        };
+        let field = close_field(&voxels, &grid, &params, 2.5);
+        // The hollow centre is enclosed → filled solid (negative).
+        assert!(field[grid.index(3, 3, 3)] < 0.0);
+        // A voxel outside the shell stays empty (positive).
+        assert!(field[grid.index(0, 0, 0)] > 0.0);
+    }
+
+    #[test]
+    fn close_voxels_bridges_a_gap() {
+        let (grid, voxels) = shell_grid(true);
+        let c = grid.index(3, 3, 3);
+        // With no bridging the flood leaks through the hole → centre is exterior.
+        let leaky = close_field(
+            &voxels,
+            &grid,
+            &MeshParams { close_voxels: 0, ..MeshParams::default() },
+            2.5,
+        );
+        assert!(leaky[c] > 0.0, "gap should leak without bridging");
+        // One dilation step seals the 1-voxel gap → centre fills solid.
+        let sealed = close_field(
+            &voxels,
+            &grid,
+            &MeshParams { close_voxels: 1, ..MeshParams::default() },
+            2.5,
+        );
+        assert!(sealed[c] < 0.0, "close_voxels should bridge the gap");
+    }
 }

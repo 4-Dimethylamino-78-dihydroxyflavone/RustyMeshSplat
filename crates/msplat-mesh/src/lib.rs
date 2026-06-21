@@ -8,11 +8,15 @@
 mod color;
 mod export;
 mod mesh;
+mod point_cloud;
 mod splat_ply;
 mod surface_nets;
 mod tsdf;
 
 pub use export::{write_glb, write_obj, write_ply};
 pub use mesh::TriMesh;
+pub use point_cloud::{
+    PointCloud, load_camera_centers, load_point_cloud, point_cloud_to_splats,
+};
 pub use splat_ply::{SplatCloud, load_splat_ply};
 pub use tsdf::{ExtractProgress, MeshParams, extract_mesh};
