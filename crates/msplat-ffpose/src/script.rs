@@ -32,11 +32,13 @@ pub fn materialize_script(backend: FfBackend) -> Result<PathBuf> {
         return Ok(p);
     }
 
-    // The non-commercial MASt3R code only enters the resolved environment
-    // when that backend is actually requested.
+    // The script writes COLMAP text itself, so the heavy/native `colmap`
+    // extra (pycolmap, open3d, lightglue) is never needed. Only the MASt3R
+    // backend pulls an extra — and its non-commercial code only enters the
+    // resolved environment when that backend is actually requested.
     let extras = match backend {
-        FfBackend::MapAnything => "colmap",
-        FfBackend::Mast3r => "colmap,mast3r",
+        FfBackend::MapAnything => "",
+        FfBackend::Mast3r => "[mast3r]",
     };
     let body = SCRIPT.replace("{{EXTRAS}}", extras);
 
@@ -62,10 +64,11 @@ mod tests {
     #[test]
     fn extras_are_substituted_per_backend() {
         assert!(SCRIPT.contains("{{EXTRAS}}"), "template token missing");
-        let map_anything = SCRIPT.replace("{{EXTRAS}}", "colmap");
-        let mast3r = SCRIPT.replace("{{EXTRAS}}", "colmap,mast3r");
-        assert!(map_anything.contains("mapanything[colmap] @"));
-        assert!(mast3r.contains("mapanything[colmap,mast3r] @"));
+        // MapAnything needs no pip extra; only MASt3R pulls one.
+        let map_anything = SCRIPT.replace("{{EXTRAS}}", "");
+        let mast3r = SCRIPT.replace("{{EXTRAS}}", "[mast3r]");
+        assert!(map_anything.contains("mapanything @ "));
+        assert!(mast3r.contains("mapanything[mast3r] @ "));
         // Different content must produce different cache filenames.
         assert_ne!(fnv1a(&map_anything), fnv1a(&mast3r));
     }
