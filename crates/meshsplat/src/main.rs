@@ -104,6 +104,11 @@ struct Cli {
     /// With --mesh-only: a COLMAP sparse dir (sparse/0) for camera-aware normals.
     #[arg(long)]
     sparse: Option<PathBuf>,
+    /// Camera positions for orienting normals when meshing an external point
+    /// cloud: one camera per line with x y z in the first three numeric
+    /// columns (COLMAP or Metashape "Export Cameras" text both work).
+    #[arg(long)]
+    cameras: Option<PathBuf>,
 
     /// TSDF grid resolution along the longest axis.
     #[arg(long)]
@@ -114,6 +119,15 @@ struct Cli {
     /// Laplacian smoothing passes on the mesh.
     #[arg(long)]
     smooth_iters: Option<u32>,
+    /// Close the mesh into a fuller, watertight-ish solid: fill enclosed
+    /// interior and bridge gaps so surfaces wrap around instead of leaving the
+    /// observed region open. Best for object-centric captures and point clouds.
+    #[arg(long)]
+    watertight: bool,
+    /// With --watertight: bridge holes up to roughly 2× this many voxels wide
+    /// (0 = fill fully-enclosed cavities only).
+    #[arg(long)]
+    close_voxels: Option<u32>,
 
     /// Random seed.
     #[arg(long, default_value_t = 42)]
@@ -185,17 +199,23 @@ enum InputKind {
     Photos(PathBuf),
     /// Already-posed dataset (COLMAP sparse/ or nerfstudio transforms.json).
     Dataset(PathBuf),
-    /// A trained splat checkpoint.
-    SplatPly(PathBuf),
+    /// A mesh-stage input file: a trained splat `.ply`, or an external point
+    /// cloud (`.ply` / `.obj`) to mesh directly.
+    MeshFile(PathBuf),
 }
 
 fn classify_input(path: &Path, mesh_only: bool) -> Result<InputKind> {
     if path.is_file() {
-        if path.extension().and_then(|e| e.to_str()) == Some("ply") {
-            return Ok(InputKind::SplatPly(path.to_owned()));
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        if matches!(ext.as_deref(), Some("ply") | Some("obj")) {
+            return Ok(InputKind::MeshFile(path.to_owned()));
         }
         bail!(
-            "Input file {} is not a .ply — pass a photo directory or a splat file",
+            "Input file {} is not a .ply/.obj — pass a photo directory, a trained \
+             splat .ply, or an external point cloud (.ply / .obj)",
             path.display()
         );
     }
@@ -220,6 +240,27 @@ fn classify_input(path: &Path, mesh_only: bool) -> Result<InputKind> {
         );
     }
     Ok(InputKind::Photos(path.to_owned()))
+}
+
+/// Load a mesh-stage input as a fusable cloud: a 3DGS splat PLY when the file
+/// is one, otherwise an external point cloud (`.ply` / `.obj`) wrapped as
+/// oriented gaussians.
+fn load_cloud_for_mesh(path: &Path) -> Result<msplat_mesh::SplatCloud> {
+    let is_ply = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("ply"));
+    if is_ply {
+        match msplat_mesh::load_splat_ply(path) {
+            Ok(splat) => return Ok(splat),
+            Err(err) => log::info!(
+                "{} is not a 3DGS splat PLY ({err}); meshing it as a point cloud",
+                path.display()
+            ),
+        }
+    }
+    let pc = msplat_mesh::load_point_cloud(path)?;
+    Ok(msplat_mesh::point_cloud_to_splats(&pc))
 }
 
 fn spinner(multi: &MultiProgress, msg: String) -> ProgressBar {
@@ -277,7 +318,7 @@ async fn run() -> Result<()> {
 
     // Bring the GPU up *first* when training is needed: a machine that can't
     // train should fail in milliseconds, not after minutes of pose estimation.
-    let needs_training = !matches!(kind, InputKind::SplatPly(_));
+    let needs_training = !matches!(kind, InputKind::MeshFile(_));
     if needs_training {
         let active = gpu::init_for_training(&gpu_opts).await?;
         eprintln!("◆ GPU: {}", active.describe());
@@ -348,14 +389,14 @@ async fn run() -> Result<()> {
             };
             (dir.clone(), sparse.is_dir().then_some(sparse))
         }
-        InputKind::SplatPly(_) => (PathBuf::new(), cli.sparse.clone()),
+        InputKind::MeshFile(_) => (PathBuf::new(), cli.sparse.clone()),
     };
 
     // ── Stage 2: splat training ─────────────────────────────────────────
     let splat_path = match &kind {
-        InputKind::SplatPly(ply) => {
-            eprintln!("\n■ Stage 2/3 — training: skipped (--mesh-only)");
-            ply.clone()
+        InputKind::MeshFile(path) => {
+            eprintln!("\n■ Stage 2/3 — training: skipped (meshing an existing file)");
+            path.clone()
         }
         _ => {
             eprintln!("\n■ Stage 2/3 — training gaussian splat (Brush · wgpu)");
@@ -398,15 +439,22 @@ async fn run() -> Result<()> {
         eprintln!("\n■ Stage 3/3 — extracting mesh (TSDF + surface nets)");
         let mesh_start = std::time::Instant::now();
 
-        let camera_centers = match &sparse_dir {
-            Some(dir) if dir.is_dir() => msplat_colmap::read_sparse_model(dir)
-                .await
-                .map(|m| m.camera_centers())
-                .unwrap_or_else(|e| {
-                    log::warn!("Could not read camera poses for normal orientation: {e}");
-                    Vec::new()
-                }),
-            _ => Vec::new(),
+        let camera_centers = if let Some(cam_file) = &cli.cameras {
+            msplat_mesh::load_camera_centers(cam_file).unwrap_or_else(|e| {
+                log::warn!("--cameras: {e}");
+                Vec::new()
+            })
+        } else {
+            match &sparse_dir {
+                Some(dir) if dir.is_dir() => msplat_colmap::read_sparse_model(dir)
+                    .await
+                    .map(|m| m.camera_centers())
+                    .unwrap_or_else(|e| {
+                        log::warn!("Could not read camera poses for normal orientation: {e}");
+                        Vec::new()
+                    }),
+                _ => Vec::new(),
+            }
         };
 
         let params = MeshParams {
@@ -415,6 +463,8 @@ async fn run() -> Result<()> {
             smooth_iters: cli
                 .smooth_iters
                 .unwrap_or(MeshParams::default().smooth_iters),
+            watertight: cli.watertight,
+            close_voxels: cli.close_voxels.unwrap_or(MeshParams::default().close_voxels),
             ..MeshParams::default()
         };
 
@@ -429,7 +479,7 @@ async fn run() -> Result<()> {
         let splat_for_task = splat_path.clone();
         let bar_for_task = bar.clone();
         let mesh = tokio::task::spawn_blocking(move || -> Result<msplat_mesh::TriMesh> {
-            let cloud = msplat_mesh::load_splat_ply(&splat_for_task)?;
+            let cloud = load_cloud_for_mesh(&splat_for_task)?;
             msplat_mesh::extract_mesh(&cloud, &camera_centers, &params, |p| match p {
                 ExtractProgress::Phase(name) => bar_for_task.set_message(name),
                 ExtractProgress::Fusing(frac) => {

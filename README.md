@@ -87,13 +87,17 @@ meshsplat ./my_photos --splat-only
 # mesh an existing splat (optionally with poses for better normals)
 meshsplat ./out/splat.ply --mesh-only --sparse ./out/work/colmap/sparse/0
 
+# mesh an external point cloud (Metashape/COLMAP/any .ply or .obj) directly,
+# closed into a fuller watertight-ish solid, with cameras to orient normals
+meshsplat ./dense_cloud.ply --mesh-only --watertight --cameras ./cameras.txt
+
 # what does my machine support?
 meshsplat --doctor
 ```
 
 Key flags: `--iters`, `--max-splats`, `--max-resolution` (training);
-`--grid-res`, `--opacity-min`, `--smooth-iters` (meshing); `--cpu-sfm`,
-`--colmap <PATH>`, `--poses <BACKEND>` (pose estimation). See
+`--grid-res`, `--opacity-min`, `--smooth-iters`, `--watertight` (meshing);
+`--cpu-sfm`, `--colmap <PATH>`, `--poses <BACKEND>` (pose estimation). See
 `meshsplat --help`.
 
 ### Inputs
@@ -104,6 +108,10 @@ Key flags: `--iters`, `--max-splats`, `--max-resolution` (training);
   nerfstudio `transforms.json`): pose estimation is skipped. This ingests
   the raw output of MapAnything's / VGGT's `demo_colmap.py` directly.
 - **Splat `.ply`** with `--mesh-only`: only mesh extraction runs.
+- **External point cloud** (`.ply` ASCII or binary, or `.obj`) with
+  `--mesh-only`: a dense cloud from Metashape, COLMAP, or any tool is meshed
+  directly — normals are estimated when the file lacks them, and `--cameras`
+  orients them. Add `--watertight` to wrap it into a fuller closed solid.
 
 ### Difficult scenes (low overlap, turntables, glossy specimens)
 
@@ -217,6 +225,10 @@ meshsplat prints a license notice whenever a non-commercial option is used.
 - COLMAP-rescue hybrid: feed a partial COLMAP solve (poses + intrinsics for
   the registered subset) into MapAnything's multi-modal inference to complete
   the scene
+- Poisson surface reconstruction as `--mesh poisson`: smoothly hallucinate
+  unseen surface for fully complete 360° objects from partial scans (the
+  next phase beyond `--watertight`, which seals holes/cavities but won't
+  invent large never-observed regions)
 - GPU depth-map rendering + depth TSDF fusion (RaDe-GS-style) for higher
   mesh fidelity
 - [MILo](https://github.com/Anttwo/MILo) / [MeshSplatting](https://meshsplatting.github.io/)-style
@@ -242,7 +254,7 @@ patched wgpu fork — keep it checked in.
 | `crates/meshsplat` | CLI binary: stage orchestration, progress UI, GPU probe |
 | `crates/msplat-colmap` | COLMAP locate/auto-download, SfM pipeline runner, sparse-model parsing |
 | `crates/msplat-ffpose` | Feed-forward poses: uv runtime discovery, bundled MapAnything script, subprocess orchestration |
-| `crates/msplat-mesh` | Splat PLY loader, TSDF fusion, surface nets, PLY/OBJ/GLB export |
+| `crates/msplat-mesh` | Splat/point-cloud (PLY/OBJ) loaders, normal estimation, TSDF fusion + optional watertight closing, surface nets, PLY/OBJ/GLB export |
 
 ## License
 
