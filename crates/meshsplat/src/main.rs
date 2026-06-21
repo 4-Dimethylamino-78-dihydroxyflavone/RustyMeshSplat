@@ -50,6 +50,10 @@ struct Cli {
     /// Max training image resolution (larger photos are downscaled).
     #[arg(long)]
     max_resolution: Option<u32>,
+    /// Spherical-harmonics degree for view-dependent colour (3 = standard 3DGS
+    /// quality; 0 = flat colour). Higher uses more GPU memory per splat.
+    #[arg(long, default_value_t = 3)]
+    sh_degree: u32,
 
     /// How the photos were captured: auto, unordered, sequential (turntable/video).
     #[arg(long, default_value = "auto")]
@@ -406,6 +410,7 @@ async fn run() -> Result<()> {
                     iters: cli.iters.unwrap_or(preset.iters),
                     max_splats: cli.max_splats.unwrap_or(preset.max_splats),
                     max_resolution: cli.max_resolution.unwrap_or(preset.max_resolution),
+                    sh_degree: cli.sh_degree,
                     seed: cli.seed,
                     export_dir: out_dir.clone(),
                 },

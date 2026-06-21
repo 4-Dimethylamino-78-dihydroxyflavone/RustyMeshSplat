@@ -11,6 +11,9 @@ pub struct TrainSettings {
     pub iters: u32,
     pub max_splats: u32,
     pub max_resolution: u32,
+    /// Spherical-harmonics degree for view-dependent colour (3 = standard 3DGS;
+    /// 0 = flat colour). Higher costs more memory per splat.
+    pub sh_degree: u32,
     pub seed: u64,
     /// Absolute directory the trained splat PLY is exported into.
     pub export_dir: PathBuf,
@@ -61,6 +64,9 @@ pub async fn train_splat(
             config.train_config.total_train_iters = settings.iters;
             config.train_config.max_splats = settings.max_splats;
             config.load_config.max_resolution = settings.max_resolution;
+            // Brush only emits view-dependent SH coefficients when the initial
+            // splats carry the degree; default leaves it at 0 (flat colour).
+            config.model_config.sh_degree = settings.sh_degree;
             config.process_config.seed = settings.seed;
             config.process_config.export_path = export_dir.display().to_string();
             config.process_config.export_name = SPLAT_FILE.to_owned();
