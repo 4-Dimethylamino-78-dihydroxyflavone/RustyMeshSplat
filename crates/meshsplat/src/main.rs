@@ -74,6 +74,12 @@ struct Cli {
     /// Path to a COLMAP binary (otherwise auto-detected / auto-downloaded).
     #[arg(long)]
     colmap: Option<PathBuf>,
+    /// Which prebuilt COLMAP to auto-download when none is found (Windows only):
+    /// auto (CUDA build when an NVIDIA GPU is present — much faster SIFT
+    /// extraction + matching — else no-CUDA), cuda, or nocuda. Ignored when
+    /// --colmap points at an existing install.
+    #[arg(long, default_value = "auto")]
+    colmap_build: String,
     /// Directory of per-image masks (black = ignored, e.g. "photo.jpg.png").
     /// Strongly recommended for turntable captures: mask the static
     /// background so SfM locks onto the rotating object.
@@ -254,6 +260,27 @@ fn classify_input(path: &Path, mesh_only: bool) -> Result<InputKind> {
     Ok(InputKind::Photos(path.to_owned()))
 }
 
+/// Does this adapter name look like an NVIDIA GPU (so the CUDA COLMAP build and
+/// CUDA feed-forward inference are the fast path)?
+fn is_nvidia(adapter_name: &str) -> bool {
+    let n = adapter_name.to_ascii_lowercase();
+    n.contains("nvidia")
+        || n.contains("geforce")
+        || n.contains("rtx")
+        || n.contains("quadro")
+        || n.contains("tesla")
+}
+
+/// Resolve `--colmap-build` into "fetch the CUDA prebuilt?".
+fn resolve_colmap_cuda(choice: &str, gpu_is_nvidia: bool) -> Result<bool> {
+    match choice.to_ascii_lowercase().as_str() {
+        "auto" => Ok(gpu_is_nvidia),
+        "cuda" => Ok(true),
+        "nocuda" | "no-cuda" => Ok(false),
+        other => bail!("unknown --colmap-build '{other}' (expected auto|cuda|nocuda)"),
+    }
+}
+
 /// Default filename tag for a run when `--tag` isn't given: the reconstruction
 /// method that distinguishes it from other runs in the same output dir.
 fn default_tag(kind: &InputKind, cli: &Cli) -> String {
@@ -410,6 +437,7 @@ async fn run() -> Result<()> {
     // Bring the GPU up *first* when training is needed: a machine that can't
     // train should fail in milliseconds, not after minutes of pose estimation.
     let needs_training = !matches!(kind, InputKind::MeshFile(_));
+    let mut gpu_is_nvidia = false;
     if needs_training {
         let active = gpu::init_for_training(&gpu_opts).await?;
         eprintln!("◆ GPU: {}", active.describe());
@@ -419,10 +447,14 @@ async fn run() -> Result<()> {
                  any real GPU will be dramatically faster"
             );
         }
+        gpu_is_nvidia = is_nvidia(&active.name);
         run.gpu = Some(active.describe());
     } else {
         eprintln!("◆ GPU: not needed (--mesh-only runs on CPU)");
     }
+    // CUDA-first at the SfM bottleneck: when auto-downloading COLMAP, prefer the
+    // CUDA prebuilt on an NVIDIA GPU (no effect when --colmap is an explicit path).
+    let colmap_cuda = resolve_colmap_cuda(&cli.colmap_build, gpu_is_nvidia)?;
 
     let multi = MultiProgress::new();
     let total_start = std::time::Instant::now();
@@ -433,7 +465,7 @@ async fn run() -> Result<()> {
             let (sfm, backend, model) = if cli.poses.eq_ignore_ascii_case("colmap") {
                 eprintln!("\n■ Stage 1/3 — camera poses (COLMAP)");
                 let work_dir = out_dir.join("work").join("colmap");
-                let sfm = run_sfm_stage(&cli, photos, &work_dir, &multi).await?;
+                let sfm = run_sfm_stage(&cli, photos, &work_dir, &multi, colmap_cuda).await?;
                 (sfm, "colmap".to_owned(), None)
             } else {
                 let backend = cli
@@ -632,9 +664,10 @@ async fn run_sfm_stage(
     photos: &Path,
     work_dir: &Path,
     multi: &MultiProgress,
+    prefer_cuda: bool,
 ) -> Result<msplat_colmap::SfmOutput> {
     let fetch_bar = spinner(multi, "Locating COLMAP...".into());
-    let colmap = msplat_colmap::ensure_colmap(cli.colmap.as_deref(), |event| match event {
+    let colmap = msplat_colmap::ensure_colmap(cli.colmap.as_deref(), prefer_cuda, |event| match event {
         FetchEvent::Found { path, version } => {
             fetch_bar.finish_with_message(format!(
                 "COLMAP: {}{}",

@@ -159,8 +159,11 @@ levers for each (informed by the 2025–2026 pose-estimation literature):
 ### COLMAP acquisition
 
 `meshsplat` looks for COLMAP on `$PATH`, at `--colmap`, or in `$MESHSPLAT_COLMAP`.
-On Windows, if none is found it downloads the official prebuilt
-(`colmap-x64-windows-nocuda.zip`) into the user cache automatically.
+On Windows, if none is found it downloads the official prebuilt into the user
+cache automatically — `--colmap-build auto` (default) fetches the **CUDA** build
+when an NVIDIA GPU is detected (dramatically faster SIFT extraction + matching
+on large sets) and the no-CUDA build otherwise; force either with
+`--colmap-build cuda|nocuda`, or point `MESHSPLAT_COLMAP_URL` at any zip.
 On Linux/macOS install it once: `sudo apt install colmap` / `brew install colmap`.
 
 ### Feed-forward pose estimation (`--poses`)
