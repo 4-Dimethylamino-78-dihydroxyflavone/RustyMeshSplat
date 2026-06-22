@@ -39,9 +39,13 @@ impl std::str::FromStr for CaptureMode {
 /// Which COLMAP reconstruction algorithm to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapperKind {
-    /// Incremental mapping — the proven default.
+    /// Use the global mapper when the COLMAP build exposes it, else incremental.
+    /// The default: global SfM (GLOMAP, COLMAP 4.0+) is faster and more robust
+    /// on large / unordered sets, while older builds keep working.
+    Auto,
+    /// Incremental mapping — COLMAP's classic, well-calibrated path.
     Incremental,
-    /// Global mapping (GLOMAP, merged into COLMAP in 4.0.0): 1–2 orders of
+    /// Force global mapping (GLOMAP, merged into COLMAP in 4.0.0): 1–2 orders of
     /// magnitude faster at comparable accuracy. Requires a COLMAP build that
     /// exposes the `global_mapper` command; older builds error out rather than
     /// silently using the incremental mapper.
@@ -52,10 +56,11 @@ impl std::str::FromStr for MapperKind {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
             "incremental" => Ok(Self::Incremental),
             "global" | "glomap" => Ok(Self::Global),
             other => Err(format!(
-                "unknown mapper '{other}' (expected incremental|global)"
+                "unknown mapper '{other}' (expected auto|incremental|global)"
             )),
         }
     }
@@ -88,7 +93,7 @@ impl Default for SfmOptions {
             max_image_size: 3200,
             exhaustive_limit: 150,
             mask_dir: None,
-            mapper: MapperKind::Incremental,
+            mapper: MapperKind::Auto,
         }
     }
 }
@@ -156,6 +161,29 @@ pub async fn run_sfm(
         CaptureMode::Auto => images.len() <= opts.exhaustive_limit,
     };
     let total_stages = 3;
+
+    // Resolve the mapper up front so an unsupported `--sfm-mapper global` fails
+    // in milliseconds rather than after feature extraction + matching.
+    let mapper_cmd = match opts.mapper {
+        MapperKind::Auto if colmap.has_command("global_mapper") => {
+            log::info!("Using the COLMAP global mapper (GLOMAP).");
+            "global_mapper"
+        }
+        MapperKind::Auto => "mapper",
+        MapperKind::Global if colmap.has_command("global_mapper") => "global_mapper",
+        // GLOMAP was merged into COLMAP in 4.0.0 (2026-03) and the standalone
+        // glomap project is archived. Builds without it have no global mapper;
+        // fail loudly instead of silently downgrading to incremental, which
+        // would quietly ignore what the user asked for. (Auto falls back.)
+        MapperKind::Global => bail!(
+            "--sfm-mapper global needs COLMAP 4.0+ (the GLOMAP global SfM \
+             pipeline was merged into COLMAP in 4.0.0; the standalone glomap \
+             project is now archived). This COLMAP build exposes no \
+             `global_mapper` command — upgrade COLMAP, use --sfm-mapper auto, \
+             or rerun with --sfm-mapper incremental."
+        ),
+        MapperKind::Incremental => "mapper",
+    };
 
     // Stage 1: feature extraction.
     on_event(SfmEvent::StageStarted {
@@ -247,21 +275,6 @@ pub async fn run_sfm(
             index: 3,
             total: total_stages,
         });
-        let mapper_cmd = match opts.mapper {
-            MapperKind::Global if colmap.has_command("global_mapper") => "global_mapper",
-            // GLOMAP was merged into COLMAP in 4.0.0 (2026-03) and the standalone
-            // glomap project is archived. Builds without it have no global mapper;
-            // fail loudly instead of silently downgrading to incremental, which
-            // would quietly ignore what the user asked for.
-            MapperKind::Global => bail!(
-                "--sfm-mapper global needs COLMAP 4.0+ (the GLOMAP global SfM \
-                 pipeline was merged into COLMAP in 4.0.0; the standalone glomap \
-                 project is now archived). This COLMAP build exposes no \
-                 `global_mapper` command — upgrade COLMAP, or rerun with \
-                 --sfm-mapper incremental."
-            ),
-            MapperKind::Incremental => "mapper",
-        };
         let attempt_dir = sparse_out.join(format!("run{attempt}"));
         // A stale model dir would confuse the mapper and pick_best_model.
         let _ = tokio::fs::remove_dir_all(&attempt_dir).await;

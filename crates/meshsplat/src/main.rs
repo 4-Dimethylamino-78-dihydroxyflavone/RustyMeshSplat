@@ -72,9 +72,10 @@ struct Cli {
     /// background so SfM locks onto the rotating object.
     #[arg(long)]
     masks: Option<PathBuf>,
-    /// Pose reconstruction algorithm: incremental (default, proven) or
-    /// global (GLOMAP, much faster on COLMAP 4+; auto-falls back).
-    #[arg(long, default_value = "incremental")]
+    /// Pose reconstruction algorithm: auto (default — global mapper when the
+    /// COLMAP build has it, else incremental), incremental, or global (force
+    /// GLOMAP; errors on COLMAP builds without it).
+    #[arg(long, default_value = "auto")]
     sfm_mapper: String,
 
     /// Pose backend: colmap (default), or a feed-forward model for
