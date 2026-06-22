@@ -140,9 +140,17 @@ levers for each (informed by the 2025–2026 pose-estimation literature):
   run e.g. VGGT's `demo_colmap.py` yourself, then point meshsplat at the
   resulting dataset directory (it detects `sparse/` or `sparse/0/` — binary
   or text — and skips its own SfM).
-- **Hundreds of images**: `--sfm-mapper global` uses the GLOMAP global mapper
-  (integrated in COLMAP 4+, 1–2 orders of magnitude faster at comparable
-  accuracy); it falls back to incremental automatically on older COLMAP builds.
+- **Hundreds of images**: the default `--sfm-mapper auto` uses the GLOMAP
+  global mapper whenever your COLMAP build exposes it (merged into COLMAP in
+  4.0.0, 2026‑03; 1–2 orders of magnitude faster at comparable accuracy) and
+  falls back to incremental on older builds. Force it with `--sfm-mapper
+  global` (which errors on builds without the `global_mapper` command), or pin
+  the classic path with `--sfm-mapper incremental`.
+- **Many sessions / unordered piles**: prefer `--capture unordered` so every
+  pair is matched. With the default `--capture auto`, a large set first tries
+  sequential matching; if that registers under half the photos (the classic
+  multi-session collapse), meshsplat automatically retries once with exhaustive
+  matching to bridge the disconnected views.
 - **Glossy / low-texture surfaces**: more photos with smaller angular steps,
   diffuse lighting, and masks over specular hotspots help SIFT survive.
   (Detector-free learned matchers à la LoFTR/RoMa are on the roadmap via
@@ -151,8 +159,11 @@ levers for each (informed by the 2025–2026 pose-estimation literature):
 ### COLMAP acquisition
 
 `meshsplat` looks for COLMAP on `$PATH`, at `--colmap`, or in `$MESHSPLAT_COLMAP`.
-On Windows, if none is found it downloads the official prebuilt
-(`colmap-x64-windows-nocuda.zip`) into the user cache automatically.
+On Windows, if none is found it downloads the official prebuilt into the user
+cache automatically — `--colmap-build auto` (default) fetches the **CUDA** build
+when an NVIDIA GPU is detected (dramatically faster SIFT extraction + matching
+on large sets) and the no-CUDA build otherwise; force either with
+`--colmap-build cuda|nocuda`, or point `MESHSPLAT_COLMAP_URL` at any zip.
 On Linux/macOS install it once: `sudo apt install colmap` / `brew install colmap`.
 
 ### Feed-forward pose estimation (`--poses`)
@@ -201,7 +212,9 @@ meshsplat prints a license notice whenever a non-commercial option is used.
 ## Pipeline
 
 1. **Camera poses** — COLMAP feature extraction → matching (exhaustive for
-   small sets, sequential for ordered/turntable sets) → incremental mapping.
+   small sets, sequential for large ordered sets, auto-escalating to exhaustive
+   if a sequential pass registers under half the photos) → mapping (GLOMAP
+   global mapper by default on COLMAP 4.0+, else incremental).
    GPU SIFT is attempted and falls back to CPU transparently. With
    `--poses mapanything|mast3r`, a feed-forward model produces the poses
    instead (uv-provisioned Python subprocess emitting the same COLMAP-format

@@ -5,9 +5,16 @@ use futures_util::StreamExt;
 
 use crate::locate::{ColmapBinary, install_dir, locate};
 
-/// Official prebuilt for Windows. No CUDA required — SIFT runs on CPU or GL.
-const WINDOWS_ZIP_URL: &str =
+/// Official prebuilt for Windows, no-CUDA variant. SIFT runs on CPU or GL —
+/// works on any GPU vendor.
+const WINDOWS_NOCUDA_ZIP_URL: &str =
     "https://github.com/colmap/colmap/releases/download/4.0.4/colmap-x64-windows-nocuda.zip";
+
+/// Official prebuilt for Windows, CUDA variant. Much faster SIFT extraction +
+/// matching on an NVIDIA GPU — the dominant cost on large image sets. Needs a
+/// recent NVIDIA driver (the CUDA runtime DLLs are bundled).
+const WINDOWS_CUDA_ZIP_URL: &str =
+    "https://github.com/colmap/colmap/releases/download/4.0.4/colmap-x64-windows-cuda.zip";
 
 /// Progress events while acquiring COLMAP.
 pub enum FetchEvent {
@@ -18,8 +25,11 @@ pub enum FetchEvent {
 
 /// Find COLMAP, or (on Windows) download the official prebuilt into the
 /// cache dir. On Linux/macOS we refuse to guess and print install steps.
+/// `prefer_cuda` selects the CUDA prebuilt for the auto-download (NVIDIA GPUs);
+/// `MESHSPLAT_COLMAP_URL` overrides the choice entirely.
 pub async fn ensure_colmap(
     explicit: Option<&Path>,
+    prefer_cuda: bool,
     mut on_event: impl FnMut(FetchEvent),
 ) -> Result<ColmapBinary> {
     if let Some(bin) = locate(explicit) {
@@ -49,7 +59,12 @@ pub async fn ensure_colmap(
         );
     }
 
-    let url = std::env::var("MESHSPLAT_COLMAP_URL").unwrap_or_else(|_| WINDOWS_ZIP_URL.to_owned());
+    let default_url = if prefer_cuda {
+        WINDOWS_CUDA_ZIP_URL
+    } else {
+        WINDOWS_NOCUDA_ZIP_URL
+    };
+    let url = std::env::var("MESHSPLAT_COLMAP_URL").unwrap_or_else(|_| default_url.to_owned());
     let dest = install_dir().context("No usable cache directory on this system")?;
     tokio::fs::create_dir_all(&dest).await?;
 

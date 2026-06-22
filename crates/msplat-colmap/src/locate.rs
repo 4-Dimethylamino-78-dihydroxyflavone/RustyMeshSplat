@@ -30,6 +30,33 @@ impl ColmapBinary {
         Some(line.split("--").next().unwrap_or(line).trim().to_owned())
     }
 
+    /// Major version from the banner ("COLMAP 4.0.3" → 4). COLMAP 4.0 relocated
+    /// several option namespaces, so callers gate fallbacks on this.
+    pub fn major_version(&self) -> Option<u32> {
+        let v = self.version()?;
+        v.split_whitespace()
+            .last()?
+            .split('.')
+            .next()?
+            .parse()
+            .ok()
+    }
+
+    /// Full `--help` text for a subcommand (stdout+stderr), used to discover the
+    /// exact option flags this build exposes. Empty if the probe can't run.
+    pub fn subcommand_help(&self, subcommand: &str) -> String {
+        Command::new(&self.path)
+            .arg(subcommand)
+            .arg("--help")
+            .output()
+            .map(|o| {
+                let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+                s.push_str(&String::from_utf8_lossy(&o.stderr));
+                s
+            })
+            .unwrap_or_default()
+    }
+
     /// Does this build offer a subcommand (e.g. `global_mapper`)?
     pub fn has_command(&self, command: &str) -> bool {
         Command::new(&self.path)
