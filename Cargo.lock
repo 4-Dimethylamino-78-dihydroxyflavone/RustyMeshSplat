@@ -5096,7 +5096,7 @@ dependencies = [
 
 [[package]]
 name = "meshsplat"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "brush-process",
@@ -5196,7 +5196,7 @@ checksum = "96a1fe2275b68991faded2c80aa4a33dba398b77d276038b8f50701a22e55918"
 
 [[package]]
 name = "msplat-colmap"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "colmap-reader",
@@ -5214,7 +5214,7 @@ dependencies = [
 
 [[package]]
 name = "msplat-ffpose"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "dirs",
@@ -5228,7 +5228,7 @@ dependencies = [
 
 [[package]]
 name = "msplat-mesh"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "glam",

@@ -17,6 +17,9 @@ pub struct TrainSettings {
     pub seed: u64,
     /// Absolute directory the trained splat PLY is exported into.
     pub export_dir: PathBuf,
+    /// Filename for the exported splat PLY (method tag is burned in by the
+    /// caller, e.g. `splat.colmap.ply`).
+    pub export_name: String,
 }
 
 pub struct TrainOutcome {
@@ -25,8 +28,6 @@ pub struct TrainOutcome {
     pub last_psnr: Option<f32>,
     pub elapsed: Duration,
 }
-
-const SPLAT_FILE: &str = "splat.ply";
 
 /// `element vertex N` from a PLY header.
 fn ply_vertex_count(path: &Path) -> Option<u32> {
@@ -55,6 +56,7 @@ pub async fn train_splat(
     tokio::fs::create_dir_all(&settings.export_dir).await?;
 
     let export_dir = settings.export_dir.clone();
+    let export_name = settings.export_name.clone();
     let iters = settings.iters;
     let mut process = create_process(
         DataSource::Path(dataset_dir.display().to_string()),
@@ -69,7 +71,7 @@ pub async fn train_splat(
             config.model_config.sh_degree = settings.sh_degree;
             config.process_config.seed = settings.seed;
             config.process_config.export_path = export_dir.display().to_string();
-            config.process_config.export_name = SPLAT_FILE.to_owned();
+            config.process_config.export_name = export_name.clone();
             // Export only the final model (the last step always exports).
             config.process_config.export_every = settings.iters.max(1);
             Some(config)
@@ -136,7 +138,7 @@ pub async fn train_splat(
     }
     bar.finish_with_message("done");
 
-    let splat_path = settings.export_dir.join(SPLAT_FILE);
+    let splat_path = settings.export_dir.join(&settings.export_name);
     if !splat_path.is_file() {
         anyhow::bail!(
             "Training finished but no splat was exported to {}",

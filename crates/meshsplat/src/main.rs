@@ -37,6 +37,13 @@ struct Cli {
     #[arg(short, long, default_value = "./meshsplat_out")]
     output: PathBuf,
 
+    /// Tag burned into every output filename and into report.json (defaults to
+    /// the reconstruction method, e.g. "colmap" or "mapanything"). Run several
+    /// methods into the same -o directory and their artifacts sit side-by-side
+    /// (`splat.colmap.ply`, `splat.mapanything.ply`, ...) for direct comparison.
+    #[arg(long)]
+    tag: Option<String>,
+
     /// Quality preset; individual flags below override it.
     #[arg(long, value_enum, default_value_t = Quality::Balanced)]
     quality: Quality,
@@ -67,14 +74,21 @@ struct Cli {
     /// Path to a COLMAP binary (otherwise auto-detected / auto-downloaded).
     #[arg(long)]
     colmap: Option<PathBuf>,
+    /// Which prebuilt COLMAP to auto-download when none is found (Windows only):
+    /// auto (CUDA build when an NVIDIA GPU is present — much faster SIFT
+    /// extraction + matching — else no-CUDA), cuda, or nocuda. Ignored when
+    /// --colmap points at an existing install.
+    #[arg(long, default_value = "auto")]
+    colmap_build: String,
     /// Directory of per-image masks (black = ignored, e.g. "photo.jpg.png").
     /// Strongly recommended for turntable captures: mask the static
     /// background so SfM locks onto the rotating object.
     #[arg(long)]
     masks: Option<PathBuf>,
-    /// Pose reconstruction algorithm: incremental (default, proven) or
-    /// global (GLOMAP, much faster on COLMAP 4+; auto-falls back).
-    #[arg(long, default_value = "incremental")]
+    /// Pose reconstruction algorithm: auto (default — global mapper when the
+    /// COLMAP build has it, else incremental), incremental, or global (force
+    /// GLOMAP; errors on COLMAP builds without it).
+    #[arg(long, default_value = "auto")]
     sfm_mapper: String,
 
     /// Pose backend: colmap (default), or a feed-forward model for
@@ -246,6 +260,95 @@ fn classify_input(path: &Path, mesh_only: bool) -> Result<InputKind> {
     Ok(InputKind::Photos(path.to_owned()))
 }
 
+/// Does this adapter name look like an NVIDIA GPU (so the CUDA COLMAP build and
+/// CUDA feed-forward inference are the fast path)?
+fn is_nvidia(adapter_name: &str) -> bool {
+    let n = adapter_name.to_ascii_lowercase();
+    n.contains("nvidia")
+        || n.contains("geforce")
+        || n.contains("rtx")
+        || n.contains("quadro")
+        || n.contains("tesla")
+}
+
+/// Resolve `--colmap-build` into "fetch the CUDA prebuilt?".
+fn resolve_colmap_cuda(choice: &str, gpu_is_nvidia: bool) -> Result<bool> {
+    match choice.to_ascii_lowercase().as_str() {
+        "auto" => Ok(gpu_is_nvidia),
+        "cuda" => Ok(true),
+        "nocuda" | "no-cuda" => Ok(false),
+        other => bail!("unknown --colmap-build '{other}' (expected auto|cuda|nocuda)"),
+    }
+}
+
+/// Default filename tag for a run when `--tag` isn't given: the reconstruction
+/// method that distinguishes it from other runs in the same output dir.
+fn default_tag(kind: &InputKind, cli: &Cli) -> String {
+    match kind {
+        InputKind::Photos(_) => {
+            if cli.poses.eq_ignore_ascii_case("colmap") {
+                "colmap".to_owned()
+            } else {
+                cli.poses.to_ascii_lowercase()
+            }
+        }
+        InputKind::Dataset(_) => "dataset".to_owned(),
+        InputKind::MeshFile(_) => "mesh".to_owned(),
+    }
+}
+
+/// Keep tags filename-safe: letters, digits, dash and underscore survive;
+/// everything else (spaces, slashes, dots) becomes a dash.
+fn sanitize_tag(tag: &str) -> String {
+    let cleaned: String = tag
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "run".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+/// Human-readable pipeline descriptor recorded in report.json, so a result is
+/// self-explaining: which poses, which trainer, which mesher produced it.
+fn describe_method(kind: &InputKind, cli: &Cli) -> String {
+    let mesh = if cli.splat_only {
+        "skipped (--splat-only)"
+    } else {
+        "tsdf+surface-nets"
+    };
+    match kind {
+        InputKind::Photos(_) => {
+            let poses = if cli.poses.eq_ignore_ascii_case("colmap") {
+                format!("colmap (mapper={})", cli.sfm_mapper)
+            } else {
+                format!(
+                    "{} (feed-forward, model={})",
+                    cli.poses.to_ascii_lowercase(),
+                    cli.poses_model
+                )
+            };
+            format!("poses={poses} · train=brush(sh{}) · mesh={mesh}", cli.sh_degree)
+        }
+        InputKind::Dataset(_) => format!(
+            "poses=dataset (already posed) · train=brush(sh{}) · mesh={mesh}",
+            cli.sh_degree
+        ),
+        InputKind::MeshFile(_) => {
+            "mesh-only (existing splat / point cloud → tsdf+surface-nets)".to_owned()
+        }
+    }
+}
+
 /// Load a mesh-stage input as a fusable cloud: a 3DGS splat PLY when the file
 /// is one, otherwise an external point cloud (`.ply` / `.obj`) wrapped as
 /// oriented gaussians.
@@ -314,15 +417,27 @@ async fn run() -> Result<()> {
         .context("Missing input: pass a directory of photos (or --help)")?;
     let kind = classify_input(&input, cli.mesh_only)?;
 
+    // Method provenance: a short `tag` burned into filenames + a descriptive
+    // `method` string, so a directory of comparison runs is self-explaining.
+    let tag = sanitize_tag(&cli.tag.clone().unwrap_or_else(|| default_tag(&kind, &cli)));
+    let method = describe_method(&kind, &cli);
+
     let preset = cli.quality.preset();
     let out_dir = std::path::absolute(&cli.output)?;
     std::fs::create_dir_all(&out_dir)?;
 
-    let mut run = RunReport::default();
+    let mut run = RunReport {
+        meshsplat_version: env!("CARGO_PKG_VERSION").to_owned(),
+        method,
+        tag: tag.clone(),
+        ..RunReport::default()
+    };
+    eprintln!("◆ method: {} (tag: {})", run.method, tag);
 
     // Bring the GPU up *first* when training is needed: a machine that can't
     // train should fail in milliseconds, not after minutes of pose estimation.
     let needs_training = !matches!(kind, InputKind::MeshFile(_));
+    let mut gpu_is_nvidia = false;
     if needs_training {
         let active = gpu::init_for_training(&gpu_opts).await?;
         eprintln!("◆ GPU: {}", active.describe());
@@ -332,10 +447,14 @@ async fn run() -> Result<()> {
                  any real GPU will be dramatically faster"
             );
         }
+        gpu_is_nvidia = is_nvidia(&active.name);
         run.gpu = Some(active.describe());
     } else {
         eprintln!("◆ GPU: not needed (--mesh-only runs on CPU)");
     }
+    // CUDA-first at the SfM bottleneck: when auto-downloading COLMAP, prefer the
+    // CUDA prebuilt on an NVIDIA GPU (no effect when --colmap is an explicit path).
+    let colmap_cuda = resolve_colmap_cuda(&cli.colmap_build, gpu_is_nvidia)?;
 
     let multi = MultiProgress::new();
     let total_start = std::time::Instant::now();
@@ -346,7 +465,7 @@ async fn run() -> Result<()> {
             let (sfm, backend, model) = if cli.poses.eq_ignore_ascii_case("colmap") {
                 eprintln!("\n■ Stage 1/3 — camera poses (COLMAP)");
                 let work_dir = out_dir.join("work").join("colmap");
-                let sfm = run_sfm_stage(&cli, photos, &work_dir, &multi).await?;
+                let sfm = run_sfm_stage(&cli, photos, &work_dir, &multi, colmap_cuda).await?;
                 (sfm, "colmap".to_owned(), None)
             } else {
                 let backend = cli
@@ -413,6 +532,7 @@ async fn run() -> Result<()> {
                     sh_degree: cli.sh_degree,
                     seed: cli.seed,
                     export_dir: out_dir.clone(),
+                    export_name: format!("splat.{tag}.ply"),
                 },
                 &multi,
             )
@@ -499,12 +619,12 @@ async fn run() -> Result<()> {
         type MeshWriter = fn(&msplat_mesh::TriMesh, &Path) -> Result<()>;
         let mut outputs = Vec::new();
         let writers: [(&str, MeshWriter); 3] = [
-            ("mesh.ply", msplat_mesh::write_ply),
-            ("mesh.obj", msplat_mesh::write_obj),
-            ("mesh.glb", msplat_mesh::write_glb),
+            ("ply", msplat_mesh::write_ply),
+            ("obj", msplat_mesh::write_obj),
+            ("glb", msplat_mesh::write_glb),
         ];
-        for (name, writer) in writers {
-            let path = out_dir.join(name);
+        for (ext, writer) in writers {
+            let path = out_dir.join(format!("mesh.{tag}.{ext}"));
             writer(&mesh, &path)?;
             outputs.push(path);
         }
@@ -522,8 +642,8 @@ async fn run() -> Result<()> {
         run.outputs.extend(outputs);
     }
 
-    let report_path = run.save(&out_dir)?;
-    run.outputs.push(report_path);
+    let report_paths = run.save(&out_dir, &tag)?;
+    run.outputs.extend(report_paths);
 
     eprintln!(
         "\n✔ Done in {}. Outputs in {}:",
@@ -544,9 +664,10 @@ async fn run_sfm_stage(
     photos: &Path,
     work_dir: &Path,
     multi: &MultiProgress,
+    prefer_cuda: bool,
 ) -> Result<msplat_colmap::SfmOutput> {
     let fetch_bar = spinner(multi, "Locating COLMAP...".into());
-    let colmap = msplat_colmap::ensure_colmap(cli.colmap.as_deref(), |event| match event {
+    let colmap = msplat_colmap::ensure_colmap(cli.colmap.as_deref(), prefer_cuda, |event| match event {
         FetchEvent::Found { path, version } => {
             fetch_bar.finish_with_message(format!(
                 "COLMAP: {}{}",
