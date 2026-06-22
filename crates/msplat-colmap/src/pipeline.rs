@@ -185,6 +185,24 @@ pub async fn run_sfm(
         MapperKind::Incremental => "mapper",
     };
 
+    // COLMAP 4.0 moved shared feature/matching options (max_image_size, use_gpu,
+    // sequential overlap) out of the SiftExtraction.*/SiftMatching.* namespaces
+    // into FeatureExtraction.*/FeatureMatching.*. Derive each flag from the
+    // subcommand's own --help so one binary, 3.x or 4.x, gets options it
+    // recognises. The max_image_size fallback is version-gated because the
+    // changelog confirms that rename; the rest fall back to the legacy spelling.
+    let extract_help = colmap.subcommand_help("feature_extractor");
+    let max_size_fallback = if colmap.major_version() >= Some(4) {
+        "--FeatureExtraction.max_image_size"
+    } else {
+        "--SiftExtraction.max_image_size"
+    };
+    let max_size_flag = flag_for(&extract_help, "max_image_size", max_size_fallback);
+    let extract_gpu_flag = flag_for(&extract_help, "use_gpu", "--SiftExtraction.use_gpu");
+    let match_help = colmap.subcommand_help("sequential_matcher");
+    let overlap_flag = flag_for(&match_help, "overlap", "--SequentialMatching.overlap");
+    let match_gpu_flag = flag_for(&match_help, "use_gpu", "--SiftMatching.use_gpu");
+
     // Stage 1: feature extraction.
     on_event(SfmEvent::StageStarted {
         name: "Extracting features".to_owned(),
@@ -201,7 +219,7 @@ pub async fn run_sfm(
         "SIMPLE_RADIAL".to_owned(),
         "--ImageReader.single_camera".to_owned(),
         if opts.single_camera { "1" } else { "0" }.to_owned(),
-        "--SiftExtraction.max_image_size".to_owned(),
+        max_size_flag,
         opts.max_image_size.to_string(),
     ];
     if let Some(mask_dir) = &opts.mask_dir {
@@ -217,7 +235,7 @@ pub async fn run_sfm(
     run_with_gpu_fallback(
         colmap,
         &mut extract_args,
-        "--SiftExtraction.use_gpu",
+        &extract_gpu_flag,
         opts.cpu_only,
         |line| report_extract_progress(line, n_images, &mut on_event),
     )
@@ -255,14 +273,14 @@ pub async fn run_sfm(
                 "sequential_matcher".to_owned(),
                 "--database_path".to_owned(),
                 db_path.display().to_string(),
-                "--SequentialMatching.overlap".to_owned(),
+                overlap_flag.clone(),
                 "15".to_owned(),
             ]
         };
         run_with_gpu_fallback(
             colmap,
             &mut match_args,
-            "--SiftMatching.use_gpu",
+            &match_gpu_flag,
             opts.cpu_only,
             |line| report_match_progress(line, &mut on_event),
         )
@@ -397,6 +415,28 @@ fn parse_bracket_progress(line: &str, prefix: &str) -> Option<u64> {
     let rest = line.trim().strip_prefix(prefix)?;
     let (n, _) = rest.split_once('/')?;
     n.trim().parse().ok()
+}
+
+/// Pick the fully-qualified `--Namespace.leaf` flag for an option `leaf`
+/// (e.g. "max_image_size") from a subcommand's `--help`, falling back to
+/// `fallback` when the probe finds nothing. Lets one code path target both
+/// COLMAP 3.x (SiftExtraction.*) and 4.x (FeatureExtraction.*) spellings.
+fn flag_for(help: &str, leaf: &str, fallback: &str) -> String {
+    for tok in help.split_whitespace() {
+        let Some(body) = tok.strip_prefix("--") else {
+            continue;
+        };
+        // Help prints `--Namespace.opt arg (=default)`; trim a stray `=value`.
+        let body = body.split('=').next().unwrap_or(body);
+        let mut parts = body.splitn(3, '.');
+        if let (Some(ns), Some(opt), None) = (parts.next(), parts.next(), parts.next())
+            && !ns.is_empty()
+            && opt == leaf
+        {
+            return format!("--{ns}.{opt}");
+        }
+    }
+    fallback.to_owned()
 }
 
 /// Run COLMAP with `gpu_flag 1`; if that fails (no GL context, headless box,
@@ -536,4 +576,49 @@ async fn assemble_dataset(images_dir: &Path, model_dir: &Path, dataset_dir: &Pat
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flag_for;
+
+    // COLMAP help prints `--Namespace.option arg (=default)` lines.
+    const HELP_4X: &str = "  --FeatureExtraction.max_image_size arg (=3200)\n  \
+        --FeatureExtraction.use_gpu arg (=1)\n  --SiftExtraction.max_num_features arg (=8192)";
+    const HELP_3X: &str = "  --SiftExtraction.max_image_size arg (=3200)\n  \
+        --SiftExtraction.use_gpu arg (=1)";
+
+    #[test]
+    fn resolves_moved_namespace_on_colmap_4() {
+        assert_eq!(
+            flag_for(HELP_4X, "max_image_size", "--SiftExtraction.max_image_size"),
+            "--FeatureExtraction.max_image_size"
+        );
+        assert_eq!(
+            flag_for(HELP_4X, "use_gpu", "--SiftExtraction.use_gpu"),
+            "--FeatureExtraction.use_gpu"
+        );
+    }
+
+    #[test]
+    fn keeps_legacy_namespace_on_colmap_3() {
+        assert_eq!(
+            flag_for(HELP_3X, "max_image_size", "--FeatureExtraction.max_image_size"),
+            "--SiftExtraction.max_image_size"
+        );
+    }
+
+    #[test]
+    fn falls_back_when_option_absent() {
+        // Empty probe (binary couldn't print help) → caller's fallback.
+        assert_eq!(
+            flag_for("", "max_image_size", "--SiftExtraction.max_image_size"),
+            "--SiftExtraction.max_image_size"
+        );
+        // A different leaf must not match (max_num_features != max_image_size).
+        assert_eq!(
+            flag_for(HELP_4X, "overlap", "--SequentialMatching.overlap"),
+            "--SequentialMatching.overlap"
+        );
+    }
 }
