@@ -5,6 +5,13 @@ use serde::Serialize;
 /// Machine-readable run summary written next to the outputs.
 #[derive(Serialize, Default)]
 pub struct RunReport {
+    /// Binary version that produced this report — pins which build a result came
+    /// from when comparing runs (no more "is this the new exe?" guessing).
+    pub meshsplat_version: String,
+    /// Human-readable pipeline descriptor (pose backend → trainer → mesher).
+    pub method: String,
+    /// Short token burned into this run's output filenames.
+    pub tag: String,
     pub gpu: Option<String>,
     pub sfm: Option<SfmReport>,
     pub training: Option<TrainReport>,
@@ -40,9 +47,21 @@ pub struct MeshReport {
 }
 
 impl RunReport {
-    pub fn save(&self, out_dir: &Path) -> anyhow::Result<PathBuf> {
-        let path = out_dir.join("report.json");
-        std::fs::write(&path, serde_json::to_vec_pretty(self)?)?;
-        Ok(path)
+    /// Write `report.<tag>.json` (a per-method archive, so several methods can
+    /// be compared side-by-side in one output dir) plus a stable `report.json`
+    /// (latest run) for tooling that reads a fixed path. Returns every file
+    /// written.
+    pub fn save(&self, out_dir: &Path, tag: &str) -> anyhow::Result<Vec<PathBuf>> {
+        let bytes = serde_json::to_vec_pretty(self)?;
+        let mut written = Vec::new();
+        if !tag.is_empty() {
+            let tagged = out_dir.join(format!("report.{tag}.json"));
+            std::fs::write(&tagged, &bytes)?;
+            written.push(tagged);
+        }
+        let canonical = out_dir.join("report.json");
+        std::fs::write(&canonical, &bytes)?;
+        written.push(canonical);
+        Ok(written)
     }
 }

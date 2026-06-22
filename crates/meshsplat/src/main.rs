@@ -37,6 +37,13 @@ struct Cli {
     #[arg(short, long, default_value = "./meshsplat_out")]
     output: PathBuf,
 
+    /// Tag burned into every output filename and into report.json (defaults to
+    /// the reconstruction method, e.g. "colmap" or "mapanything"). Run several
+    /// methods into the same -o directory and their artifacts sit side-by-side
+    /// (`splat.colmap.ply`, `splat.mapanything.ply`, ...) for direct comparison.
+    #[arg(long)]
+    tag: Option<String>,
+
     /// Quality preset; individual flags below override it.
     #[arg(long, value_enum, default_value_t = Quality::Balanced)]
     quality: Quality,
@@ -247,6 +254,74 @@ fn classify_input(path: &Path, mesh_only: bool) -> Result<InputKind> {
     Ok(InputKind::Photos(path.to_owned()))
 }
 
+/// Default filename tag for a run when `--tag` isn't given: the reconstruction
+/// method that distinguishes it from other runs in the same output dir.
+fn default_tag(kind: &InputKind, cli: &Cli) -> String {
+    match kind {
+        InputKind::Photos(_) => {
+            if cli.poses.eq_ignore_ascii_case("colmap") {
+                "colmap".to_owned()
+            } else {
+                cli.poses.to_ascii_lowercase()
+            }
+        }
+        InputKind::Dataset(_) => "dataset".to_owned(),
+        InputKind::MeshFile(_) => "mesh".to_owned(),
+    }
+}
+
+/// Keep tags filename-safe: letters, digits, dash and underscore survive;
+/// everything else (spaces, slashes, dots) becomes a dash.
+fn sanitize_tag(tag: &str) -> String {
+    let cleaned: String = tag
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "run".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+/// Human-readable pipeline descriptor recorded in report.json, so a result is
+/// self-explaining: which poses, which trainer, which mesher produced it.
+fn describe_method(kind: &InputKind, cli: &Cli) -> String {
+    let mesh = if cli.splat_only {
+        "skipped (--splat-only)"
+    } else {
+        "tsdf+surface-nets"
+    };
+    match kind {
+        InputKind::Photos(_) => {
+            let poses = if cli.poses.eq_ignore_ascii_case("colmap") {
+                format!("colmap (mapper={})", cli.sfm_mapper)
+            } else {
+                format!(
+                    "{} (feed-forward, model={})",
+                    cli.poses.to_ascii_lowercase(),
+                    cli.poses_model
+                )
+            };
+            format!("poses={poses} · train=brush(sh{}) · mesh={mesh}", cli.sh_degree)
+        }
+        InputKind::Dataset(_) => format!(
+            "poses=dataset (already posed) · train=brush(sh{}) · mesh={mesh}",
+            cli.sh_degree
+        ),
+        InputKind::MeshFile(_) => {
+            "mesh-only (existing splat / point cloud → tsdf+surface-nets)".to_owned()
+        }
+    }
+}
+
 /// Load a mesh-stage input as a fusable cloud: a 3DGS splat PLY when the file
 /// is one, otherwise an external point cloud (`.ply` / `.obj`) wrapped as
 /// oriented gaussians.
@@ -315,11 +390,22 @@ async fn run() -> Result<()> {
         .context("Missing input: pass a directory of photos (or --help)")?;
     let kind = classify_input(&input, cli.mesh_only)?;
 
+    // Method provenance: a short `tag` burned into filenames + a descriptive
+    // `method` string, so a directory of comparison runs is self-explaining.
+    let tag = sanitize_tag(&cli.tag.clone().unwrap_or_else(|| default_tag(&kind, &cli)));
+    let method = describe_method(&kind, &cli);
+
     let preset = cli.quality.preset();
     let out_dir = std::path::absolute(&cli.output)?;
     std::fs::create_dir_all(&out_dir)?;
 
-    let mut run = RunReport::default();
+    let mut run = RunReport {
+        meshsplat_version: env!("CARGO_PKG_VERSION").to_owned(),
+        method,
+        tag: tag.clone(),
+        ..RunReport::default()
+    };
+    eprintln!("◆ method: {} (tag: {})", run.method, tag);
 
     // Bring the GPU up *first* when training is needed: a machine that can't
     // train should fail in milliseconds, not after minutes of pose estimation.
@@ -414,6 +500,7 @@ async fn run() -> Result<()> {
                     sh_degree: cli.sh_degree,
                     seed: cli.seed,
                     export_dir: out_dir.clone(),
+                    export_name: format!("splat.{tag}.ply"),
                 },
                 &multi,
             )
@@ -500,12 +587,12 @@ async fn run() -> Result<()> {
         type MeshWriter = fn(&msplat_mesh::TriMesh, &Path) -> Result<()>;
         let mut outputs = Vec::new();
         let writers: [(&str, MeshWriter); 3] = [
-            ("mesh.ply", msplat_mesh::write_ply),
-            ("mesh.obj", msplat_mesh::write_obj),
-            ("mesh.glb", msplat_mesh::write_glb),
+            ("ply", msplat_mesh::write_ply),
+            ("obj", msplat_mesh::write_obj),
+            ("glb", msplat_mesh::write_glb),
         ];
-        for (name, writer) in writers {
-            let path = out_dir.join(name);
+        for (ext, writer) in writers {
+            let path = out_dir.join(format!("mesh.{tag}.{ext}"));
             writer(&mesh, &path)?;
             outputs.push(path);
         }
@@ -523,8 +610,8 @@ async fn run() -> Result<()> {
         run.outputs.extend(outputs);
     }
 
-    let report_path = run.save(&out_dir)?;
-    run.outputs.push(report_path);
+    let report_paths = run.save(&out_dir, &tag)?;
+    run.outputs.extend(report_paths);
 
     eprintln!(
         "\n✔ Done in {}. Outputs in {}:",
