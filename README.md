@@ -166,6 +166,24 @@ on large sets) and the no-CUDA build otherwise; force either with
 `--colmap-build cuda|nocuda`, or point `MESHSPLAT_COLMAP_URL` at any zip.
 On Linux/macOS install it once: `sudo apt install colmap` / `brew install colmap`.
 
+**COLMAP 3.x and 4.x both work.** COLMAP 4.0 (the GLOMAP merge, 2026‑03)
+relocated several option namespaces (e.g. `SiftExtraction.max_image_size` →
+`FeatureExtraction.max_image_size`). meshsplat probes the installed binary's own
+`--help` and emits the flag spelling it understands, so a single build adapts to
+either version with no configuration.
+
+### Comparing reconstruction methods (provenance tags)
+
+Run several pose/splat methods into the **same** `-o` directory and compare them
+side by side: every run carries a **method tag** that is burned into its artifact
+names — `splat.<tag>.ply`, `mesh.<tag>.*`, `report.<tag>.json` — so nothing gets
+clobbered. `report.json` also records `method` (a
+`poses=… · train=brush(shN) · mesh=…` descriptor) and `tag`. The tag defaults
+to the reconstruction method (`colmap`, `mapanything`, `mast3r`, …); override it
+with `--tag <name>`. This is the basis for the orthogonal `--poses` / `--splat`
+backend matrix described in
+[`docs/ENGINEERING_NOTES.md`](docs/ENGINEERING_NOTES.md).
+
 ### Feed-forward pose estimation (`--poses`)
 
 `--poses mapanything` replaces COLMAP's Stage 1 with
@@ -231,6 +249,10 @@ meshsplat prints a license notice whenever a non-commercial option is used.
 
 ### Roadmap
 
+- Orthogonal **`--poses` / `--splat` backends** (AnySplat, LGTM) so the pose
+  source and the splat/render producer vary independently and tag their outputs
+  for direct comparison — design locked in
+  [`docs/ENGINEERING_NOTES.md`](docs/ENGINEERING_NOTES.md)
 - Learned matching front-end (ALIKED + LightGlue via COLMAP 4's ONNX path)
   for low-texture / wide-baseline captures
 - Full-resolution training after feed-forward poses: back-project
