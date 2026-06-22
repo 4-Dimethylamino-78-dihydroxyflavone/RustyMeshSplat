@@ -12,7 +12,9 @@ use crate::sparse::read_sparse_model;
 /// How the photos were captured. Drives the matching strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureMode {
-    /// Exhaustive matching for small sets, sequential for large ordered sets.
+    /// Exhaustive matching for small sets, sequential for large ordered sets —
+    /// and if a large sequential pass registers under half the photos, it
+    /// auto-escalates to exhaustive matching once.
     Auto,
     /// Unordered photos of a region/object from arbitrary viewpoints.
     Unordered,
@@ -39,9 +41,10 @@ impl std::str::FromStr for CaptureMode {
 pub enum MapperKind {
     /// Incremental mapping — the proven default.
     Incremental,
-    /// Global mapping (GLOMAP, integrated in COLMAP 4+): 1–2 orders of
-    /// magnitude faster at comparable accuracy. Falls back to incremental
-    /// when the installed COLMAP doesn't support it.
+    /// Global mapping (GLOMAP, merged into COLMAP in 4.0.0): 1–2 orders of
+    /// magnitude faster at comparable accuracy. Requires a COLMAP build that
+    /// exposes the `global_mapper` command; older builds error out rather than
+    /// silently using the incremental mapper.
     Global,
 }
 
@@ -147,7 +150,7 @@ pub async fn run_sfm(
     let sparse_out = work_dir.join("sparse");
     tokio::fs::create_dir_all(&sparse_out).await?;
 
-    let exhaustive = match opts.capture {
+    let mut exhaustive = match opts.capture {
         CaptureMode::Unordered => true,
         CaptureMode::Sequential => false,
         CaptureMode::Auto => images.len() <= opts.exhaustive_limit,
@@ -193,78 +196,126 @@ pub async fn run_sfm(
     .await
     .context("COLMAP feature extraction failed")?;
 
-    // Stage 2: matching.
-    on_event(SfmEvent::StageStarted {
-        name: if exhaustive {
-            "Matching images (exhaustive)"
+    // Stages 2 & 3 loop together so a collapsed sequential pass can auto-escalate
+    // to exhaustive matching. Feature extraction (Stage 1) is reused — only
+    // matching + mapping repeat — and each attempt maps into its own dir so the
+    // larger reconstruction wins even if the retry somehow does worse.
+    let mut best: Option<(PathBuf, crate::sparse::SparseModel)> = None;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+
+        // Stage 2: matching.
+        on_event(SfmEvent::StageStarted {
+            name: if exhaustive {
+                "Matching images (exhaustive)"
+            } else {
+                "Matching images (sequential)"
+            }
+            .to_owned(),
+            index: 2,
+            total: total_stages,
+        });
+        let mut match_args = if exhaustive {
+            vec![
+                "exhaustive_matcher".to_owned(),
+                "--database_path".to_owned(),
+                db_path.display().to_string(),
+            ]
         } else {
-            "Matching images (sequential)"
-        }
-        .to_owned(),
-        index: 2,
-        total: total_stages,
-    });
-    let mut match_args = if exhaustive {
-        vec![
-            "exhaustive_matcher".to_owned(),
-            "--database_path".to_owned(),
-            db_path.display().to_string(),
-        ]
-    } else {
-        vec![
-            "sequential_matcher".to_owned(),
-            "--database_path".to_owned(),
-            db_path.display().to_string(),
-            "--SequentialMatching.overlap".to_owned(),
-            "15".to_owned(),
-        ]
-    };
-    run_with_gpu_fallback(
-        colmap,
-        &mut match_args,
-        "--SiftMatching.use_gpu",
-        opts.cpu_only,
-        |line| report_match_progress(line, &mut on_event),
-    )
-    .await
-    .context("COLMAP feature matching failed")?;
+            vec![
+                "sequential_matcher".to_owned(),
+                "--database_path".to_owned(),
+                db_path.display().to_string(),
+                "--SequentialMatching.overlap".to_owned(),
+                "15".to_owned(),
+            ]
+        };
+        run_with_gpu_fallback(
+            colmap,
+            &mut match_args,
+            "--SiftMatching.use_gpu",
+            opts.cpu_only,
+            |line| report_match_progress(line, &mut on_event),
+        )
+        .await
+        .context("COLMAP feature matching failed")?;
 
-    // Stage 3: mapping (bundle adjustment included).
-    on_event(SfmEvent::StageStarted {
-        name: "Reconstructing camera poses".to_owned(),
-        index: 3,
-        total: total_stages,
-    });
-    let mapper_cmd = match opts.mapper {
-        MapperKind::Global if colmap.has_command("global_mapper") => "global_mapper",
-        MapperKind::Global => {
+        // Stage 3: mapping (bundle adjustment included).
+        on_event(SfmEvent::StageStarted {
+            name: "Reconstructing camera poses".to_owned(),
+            index: 3,
+            total: total_stages,
+        });
+        let mapper_cmd = match opts.mapper {
+            MapperKind::Global if colmap.has_command("global_mapper") => "global_mapper",
+            // GLOMAP was merged into COLMAP in 4.0.0 (2026-03) and the standalone
+            // glomap project is archived. Builds without it have no global mapper;
+            // fail loudly instead of silently downgrading to incremental, which
+            // would quietly ignore what the user asked for.
+            MapperKind::Global => bail!(
+                "--sfm-mapper global needs COLMAP 4.0+ (the GLOMAP global SfM \
+                 pipeline was merged into COLMAP in 4.0.0; the standalone glomap \
+                 project is now archived). This COLMAP build exposes no \
+                 `global_mapper` command — upgrade COLMAP, or rerun with \
+                 --sfm-mapper incremental."
+            ),
+            MapperKind::Incremental => "mapper",
+        };
+        let attempt_dir = sparse_out.join(format!("run{attempt}"));
+        // A stale model dir would confuse the mapper and pick_best_model.
+        let _ = tokio::fs::remove_dir_all(&attempt_dir).await;
+        tokio::fs::create_dir_all(&attempt_dir).await?;
+        let map_args = vec![
+            mapper_cmd.to_owned(),
+            "--database_path".to_owned(),
+            db_path.display().to_string(),
+            "--image_path".to_owned(),
+            images_dir.display().to_string(),
+            "--output_path".to_owned(),
+            attempt_dir.display().to_string(),
+        ];
+        run_colmap(colmap, &map_args, |line| {
+            report_mapper_progress(line, n_images, &mut on_event)
+        })
+        .await
+        .context("COLMAP mapping failed")?;
+
+        // The mapper may emit several disconnected models (run/0, run/1, ...).
+        // Keep this attempt's largest, and across attempts the largest overall.
+        let attempt_model_dir = pick_best_model(&attempt_dir).await?;
+        let attempt_model = read_sparse_model(&attempt_model_dir).await?;
+        let registered = attempt_model.images.len();
+        let improved = match &best {
+            Some((_, prev)) => registered > prev.images.len(),
+            None => true,
+        };
+        if improved {
+            best = Some((attempt_model_dir, attempt_model));
+        }
+        let best_registered = best.as_ref().map_or(0, |(_, m)| m.images.len());
+
+        // Auto-escalation: when Auto picked sequential and it registered less
+        // than half the photos, the views are likely multi-session / unordered —
+        // retry once with exhaustive matching to bridge the disconnected graph
+        // instead of handing back a near-empty reconstruction.
+        let collapsed = best_registered < images.len() / 2;
+        if attempt == 1 && !exhaustive && opts.capture == CaptureMode::Auto && collapsed {
             log::warn!(
-                "This COLMAP build has no global mapper (needs COLMAP 4+ with \
-                 GLOMAP integrated); using the incremental mapper instead."
+                "Sequential matching registered only {best_registered}/{} images; \
+                 retrying with exhaustive matching to bridge disconnected views.",
+                images.len()
             );
-            "mapper"
+            on_event(SfmEvent::Status(
+                "Sequential matching underperformed — retrying exhaustively".to_owned(),
+            ));
+            exhaustive = true;
+            continue;
         }
-        MapperKind::Incremental => "mapper",
-    };
-    let map_args = vec![
-        mapper_cmd.to_owned(),
-        "--database_path".to_owned(),
-        db_path.display().to_string(),
-        "--image_path".to_owned(),
-        images_dir.display().to_string(),
-        "--output_path".to_owned(),
-        sparse_out.display().to_string(),
-    ];
-    run_colmap(colmap, &map_args, |line| {
-        report_mapper_progress(line, n_images, &mut on_event)
-    })
-    .await
-    .context("COLMAP mapping failed")?;
+        break;
+    }
 
-    // The mapper may emit several disconnected models (sparse/0, sparse/1, ...).
-    // Pick the one that registered the most images.
-    let best_model = pick_best_model(&sparse_out).await?;
-    let model = read_sparse_model(&best_model).await?;
+    let (best_model, model) = best.expect("at least one mapping attempt ran");
     if model.images.is_empty() {
         bail!(
             "COLMAP could not register any cameras. The photos may lack overlap, \

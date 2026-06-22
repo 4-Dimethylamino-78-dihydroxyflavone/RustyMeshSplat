@@ -141,8 +141,15 @@ levers for each (informed by the 2025–2026 pose-estimation literature):
   resulting dataset directory (it detects `sparse/` or `sparse/0/` — binary
   or text — and skips its own SfM).
 - **Hundreds of images**: `--sfm-mapper global` uses the GLOMAP global mapper
-  (integrated in COLMAP 4+, 1–2 orders of magnitude faster at comparable
-  accuracy); it falls back to incremental automatically on older COLMAP builds.
+  (merged into COLMAP in 4.0.0, 2026‑03; 1–2 orders of magnitude faster at
+  comparable accuracy). On older COLMAP builds that lack the `global_mapper`
+  command the run stops with an upgrade hint rather than silently falling back
+  to the incremental mapper.
+- **Many sessions / unordered piles**: prefer `--capture unordered` so every
+  pair is matched. With the default `--capture auto`, a large set first tries
+  sequential matching; if that registers under half the photos (the classic
+  multi-session collapse), meshsplat automatically retries once with exhaustive
+  matching to bridge the disconnected views.
 - **Glossy / low-texture surfaces**: more photos with smaller angular steps,
   diffuse lighting, and masks over specular hotspots help SIFT survive.
   (Detector-free learned matchers à la LoFTR/RoMa are on the roadmap via
@@ -201,7 +208,9 @@ meshsplat prints a license notice whenever a non-commercial option is used.
 ## Pipeline
 
 1. **Camera poses** — COLMAP feature extraction → matching (exhaustive for
-   small sets, sequential for ordered/turntable sets) → incremental mapping.
+   small sets, sequential for large ordered sets, auto-escalating to exhaustive
+   if a sequential pass registers under half the photos) → incremental (or
+   `--sfm-mapper global`) mapping.
    GPU SIFT is attempted and falls back to CPU transparently. With
    `--poses mapanything|mast3r`, a feed-forward model produces the poses
    instead (uv-provisioned Python subprocess emitting the same COLMAP-format
